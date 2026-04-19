@@ -1,0 +1,289 @@
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+from typing import List
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import models, transforms
+
+from dataset import VRUDataset, build_query_gallery, read_split_file
+from evaluation import print_eval_report, run_eval
+from utils import choose_amp_dtype, configure_cuda_for_speed, set_seed
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train GASNet on VRU")
+    parser.add_argument("--data-root", type=Path, required=True, help="Path containing VRU folder")
+    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--base-batch-size", type=int, default=128)
+    parser.add_argument("--base-lr", type=float, default=3.5e-4)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--save-path", type=Path, default=Path("/workspace/output/gasnet_vru.pth"))
+    parser.add_argument("--log-every", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--run-eval", action="store_true", help="Run retrieval evaluation on Small/Medium/Big test splits")
+    parser.add_argument("--eval-every", type=int, default=0, help="Run evaluation every N epochs (0 = only final eval if --run-eval)")
+    parser.add_argument("--no-compile", action="store_true")
+    return parser.parse_args()
+
+
+class RGABlock(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16, spatial_size: int = 7):
+        super().__init__()
+        mid = max(1, channels // reduction)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.c_mlp = nn.Sequential(
+            nn.Conv2d(channels, mid, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, channels, kernel_size=1, bias=False),
+        )
+        self.s_mlp = nn.Sequential(
+            nn.Conv2d(1, mid, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, 1, kernel_size=1, bias=False),
+        )
+        self.spatial_size = spatial_size
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        c = self.sigmoid(self.c_mlp(self.pool(x)))
+        s = x.mean(dim=1, keepdim=True)
+        s = F.adaptive_avg_pool2d(s, self.spatial_size)
+        s = self.s_mlp(s)
+        s = F.interpolate(s, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        s = self.sigmoid(s)
+        return x * c * s
+
+
+class AggregationGate(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.branches = nn.ModuleList([
+            nn.Sequential(nn.Conv2d(in_ch, out_ch, 1, bias=False), nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)),
+            nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False), nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)),
+            nn.Sequential(nn.Conv2d(in_ch, out_ch, 5, padding=2, bias=False), nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)),
+            nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=2, dilation=2, bias=False), nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)),
+        ])
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(out_ch * 4, out_ch, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, 4, 1, bias=True),
+            nn.Softmax(dim=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feats = [b(x) for b in self.branches]
+        stacked = torch.cat(feats, dim=1)
+        weights = self.gate(stacked)
+        out = sum(feats[i] * weights[:, i : i + 1] for i in range(4))
+        return out
+
+
+class GASNet(nn.Module):
+    def __init__(self, num_classes: int):
+        super().__init__()
+        base = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
+        self.layer1 = base.layer1
+        self.layer2 = base.layer2
+        self.layer3 = base.layer3
+        self.layer4 = base.layer4
+        self.ga_blocks = nn.ModuleList([RGABlock(512) for _ in range(len(self.layer2))])
+        self.fs = AggregationGate(1024, 512)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.bnneck_global = nn.BatchNorm1d(2048)
+        self.bnneck_fs = nn.BatchNorm1d(512)
+        self.classifier_global = nn.Linear(2048, num_classes, bias=False)
+        self.classifier_fs = nn.Linear(512, num_classes, bias=False)
+
+    def forward(self, x: torch.Tensor):
+        x = self.stem(x)
+        x = self.layer1(x)
+        for block, ga in zip(self.layer2, self.ga_blocks):
+            x = ga(block(x))
+        x = self.layer3(x)
+        fs = self.fs(x)
+        x = self.layer4(x)
+
+        global_feat = self.gap(x).flatten(1)
+        fs_feat = self.gap(fs).flatten(1)
+        bn_global = self.bnneck_global(global_feat)
+        bn_fs = self.bnneck_fs(fs_feat)
+
+        if self.training:
+            return (global_feat, fs_feat), (self.classifier_global(bn_global), self.classifier_fs(bn_fs))
+        return (global_feat, fs_feat), (bn_global, bn_fs)
+
+
+def batch_hard_triplet_loss(feat: torch.Tensor, labels: torch.Tensor, margin: float = 0.3) -> torch.Tensor:
+    dist = torch.cdist(feat, feat, p=2)
+    labels = labels.view(-1, 1)
+    mask_pos = labels.eq(labels.t())
+    mask_neg = ~mask_pos
+
+    dist_pos = dist.clone()
+    dist_pos[~mask_pos] = -1.0
+    dist_pos.fill_diagonal_(-1.0)
+    hardest_pos, _ = dist_pos.max(dim=1)
+
+    dist_neg = dist.clone()
+    dist_neg[~mask_neg] = 1e9
+    hardest_neg, _ = dist_neg.min(dim=1)
+
+    valid = hardest_pos > -0.5
+    if valid.sum() == 0:
+        return torch.tensor(0.0, device=feat.device)
+    return F.relu(hardest_pos[valid] - hardest_neg[valid] + margin).mean()
+
+
+def make_loader(samples: List, transform, batch_size: int, is_train: bool, relabel=False, label_map=None, num_workers: int = 4):
+    ds = VRUDataset(samples=samples, transform=transform, relabel=relabel, label_map=label_map, max_retries=3)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=is_train,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=is_train,
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    set_seed(args.seed)
+    configure_cuda_for_speed()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_channels_last = torch.cuda.is_available()
+    amp_dtype = choose_amp_dtype()
+    use_amp = torch.cuda.is_available()
+    use_scaler = use_amp and amp_dtype == torch.float16
+
+    vru_dir = args.data_root / "VRU"
+    pic_dir = vru_dir / "Pic"
+    split_dir = vru_dir / "train_test_split"
+
+    train_samples = read_split_file(pic_dir, split_dir / "train_list.txt")
+    train_ids = sorted({s.vehicle_id for s in train_samples})
+    train_label_map = {vid: i for i, vid in enumerate(train_ids)}
+    num_classes = len(train_label_map)
+
+    train_tfms = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomCrop((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    test_tfms = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.CenterCrop((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    batch_size = args.batch_size
+    learning_rate = args.base_lr * (batch_size / args.base_batch_size)
+
+    train_loader = make_loader(train_samples, train_tfms, batch_size, True, relabel=True, label_map=train_label_map, num_workers=args.num_workers)
+
+    model = GASNet(num_classes=num_classes).to(device)
+    if use_channels_last:
+        model = model.to(memory_format=torch.channels_last)
+
+    if torch.cuda.is_available() and hasattr(torch, "compile") and (not args.no_compile):
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model, mode="reduce-overhead")
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+    # New API first, old API fallback for compatibility.
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    except Exception:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+
+    print(
+        f"device={device}, amp={use_amp}, amp_dtype={amp_dtype}, channels_last={use_channels_last}, "
+        f"batch={batch_size}, lr={learning_rate:.6f}"
+    )
+
+    model.train()
+    ce_loss = nn.CrossEntropyLoss()
+
+    for epoch in range(1, args.epochs + 1):
+        running = 0.0
+        t0 = time.time()
+        for step, (imgs, labels, _, _) in enumerate(train_loader, 1):
+            if use_channels_last:
+                imgs = imgs.to(device, non_blocking=True, memory_format=torch.channels_last)
+            else:
+                imgs = imgs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                (g_feat, f_feat), (logits_g, logits_f) = model(imgs)
+                loss_id = ce_loss(logits_g, labels) + ce_loss(logits_f, labels)
+                loss_tri = batch_hard_triplet_loss(g_feat, labels) + batch_hard_triplet_loss(f_feat, labels)
+                loss = loss_id + loss_tri
+
+            optimizer.zero_grad(set_to_none=True)
+            if use_amp and use_scaler:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+
+            running += loss.item() * imgs.size(0)
+
+            if step == 1 or step % args.log_every == 0 or step == len(train_loader):
+                print(f"  epoch {epoch} step {step}/{len(train_loader)} loss={loss.item():.4f}")
+
+        epoch_loss = running / len(train_loader.dataset)
+        print(f"Epoch {epoch}: loss={epoch_loss:.4f}, time={(time.time() - t0)/60:.1f} min")
+
+        should_eval_this_epoch = args.run_eval and args.eval_every > 0 and (epoch % args.eval_every == 0)
+        if should_eval_this_epoch:
+            metrics = run_eval(
+                model=model,
+                data_root=args.data_root,
+                test_transform=test_tfms,
+                batch_size=batch_size,
+                num_workers=args.num_workers,
+                device=device,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                use_channels_last=use_channels_last,
+            )
+            print_eval_report(metrics, title=f"Evaluation @ Epoch {epoch}")
+
+    if args.run_eval:
+        metrics = run_eval(
+            model=model,
+            data_root=args.data_root,
+            test_transform=test_tfms,
+            batch_size=batch_size,
+            num_workers=args.num_workers,
+            device=device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            use_channels_last=use_channels_last,
+        )
+        print_eval_report(metrics, title="Final Evaluation")
+
+    args.save_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), args.save_path)
+    print(f"Saved model to {args.save_path}")
+
+
+if __name__ == "__main__":
+    main()

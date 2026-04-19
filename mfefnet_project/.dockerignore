@@ -1,0 +1,38 @@
+# Do not ship raw datasets into image
+../UAVDT
+../VisDrone
+../VRU
+../processed
+
+# Local artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.ipynb_checkpoints/
+*.pt
+*.pth
+*.onnx
+*.engine
+output/
+checkpoints/
+logs/
+wandb/
+
+# VCS
+.git
+.gitignore
+# Keep image small and prevent accidental dataset copy
+VisDrone/
+UAVDT/
+processed/
+
+# Notebook and local artifacts
+*.ipynb
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+.git/
+.gitignore

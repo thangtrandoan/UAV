@@ -1,0 +1,37 @@
+# Raw datasets (do not upload)
+UAVDT/
+VisDrone/
+VRU/
+
+# Processed data (do not upload)
+processed/
+
+# Python cache and artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Notebook and editor caches
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Training artifacts
+**/output/
+**/checkpoints/
+**/runs/
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# OS files
+.DS_Store
+Thumbs.db

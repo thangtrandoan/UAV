@@ -1,0 +1,18 @@
+# Keep image lean and avoid copying local artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+*.ipynb
+*.pt
+*.pth
+*.ckpt
+logs/
+output/
+
+# Never copy datasets into build context
+VRU/
+UAVDT/
+VisDrone/
+processed/

@@ -1,0 +1,3 @@
+numpy>=1.24
+pillow>=10.0
+# torch/torchvision are already available in the chosen base image
