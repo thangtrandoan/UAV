@@ -1,0 +1,8 @@
+1. VRU
+https://drive.google.com/file/d/1ESeeYeqbf1TIUChXNcevJK_0fyVGQpgZ/view
+
+2. VisDrone
+https://www.kaggle.com/datasets/kushagrapandya/visdrone-dataset
+
+3. UAVDT
+https://datasetninja.com/uavdt
