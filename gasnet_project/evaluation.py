@@ -17,15 +17,30 @@ SPLIT_FILE_MAP: Dict[str, str] = {
 }
 
 
-def _make_eval_loader(samples: List[Sample], transform, batch_size: int, num_workers: int) -> DataLoader:
+def _make_eval_loader(
+    samples: List[Sample],
+    transform,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int,
+) -> DataLoader:
     ds = VRUDataset(samples=samples, transform=transform, relabel=False, max_retries=3)
+    loader_kwargs = dict(
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = persistent_workers
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+
     return DataLoader(
         ds,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False,
+        **loader_kwargs,
     )
 
 
@@ -64,6 +79,9 @@ def run_eval(
     test_transform,
     batch_size: int,
     num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int,
     device: torch.device,
     use_amp: bool,
     amp_dtype: torch.dtype,
@@ -82,8 +100,24 @@ def run_eval(
         test_samples = read_split_file(pic_dir, split_dir / split_file)
         query_samples, gallery_samples = build_query_gallery(test_samples)
 
-        q_loader = _make_eval_loader(query_samples, test_transform, batch_size, num_workers)
-        g_loader = _make_eval_loader(gallery_samples, test_transform, batch_size, num_workers)
+        q_loader = _make_eval_loader(
+            query_samples,
+            test_transform,
+            batch_size,
+            num_workers,
+            pin_memory,
+            persistent_workers,
+            prefetch_factor,
+        )
+        g_loader = _make_eval_loader(
+            gallery_samples,
+            test_transform,
+            batch_size,
+            num_workers,
+            pin_memory,
+            persistent_workers,
+            prefetch_factor,
+        )
 
         q_feat, q_ids = _extract_features(model, q_loader, device, use_amp, amp_dtype, use_channels_last)
         g_feat, g_ids = _extract_features(model, g_loader, device, use_amp, amp_dtype, use_channels_last)

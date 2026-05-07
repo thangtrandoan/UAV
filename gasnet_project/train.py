@@ -23,12 +23,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--base-batch-size", type=int, default=128)
     parser.add_argument("--base-lr", type=float, default=3.5e-4)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--grad-accum", type=int, default=1, help="Accumulate gradients over N steps")
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--no-pin-memory", action="store_true")
+    parser.add_argument("--no-persistent-workers", action="store_true")
     parser.add_argument("--save-path", type=Path, default=Path("/workspace/output/gasnet_vru.pth"))
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-eval", action="store_true", help="Run retrieval evaluation on Small/Medium/Big test splits")
     parser.add_argument("--eval-every", type=int, default=0, help="Run evaluation every N epochs (0 = only final eval if --run-eval)")
+    parser.add_argument("--amp-dtype", choices=["auto", "bf16", "fp16"], default="auto")
+    parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--no-channels-last", action="store_true")
+    parser.add_argument("--no-pretrained", action="store_true", help="Disable pretrained ResNet-50 weights")
     parser.add_argument("--no-compile", action="store_true")
     return parser.parse_args()
 
@@ -87,9 +95,10 @@ class AggregationGate(nn.Module):
 
 
 class GASNet(nn.Module):
-    def __init__(self, num_classes: int):
+    def __init__(self, num_classes: int, use_pretrained: bool = True):
         super().__init__()
-        base = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        weights = models.ResNet50_Weights.DEFAULT if use_pretrained else None
+        base = models.resnet50(weights=weights)
         self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
         self.layer1 = base.layer1
         self.layer2 = base.layer2
@@ -143,15 +152,33 @@ def batch_hard_triplet_loss(feat: torch.Tensor, labels: torch.Tensor, margin: fl
     return F.relu(hardest_pos[valid] - hardest_neg[valid] + margin).mean()
 
 
-def make_loader(samples: List, transform, batch_size: int, is_train: bool, relabel=False, label_map=None, num_workers: int = 4):
+def make_loader(
+    samples: List,
+    transform,
+    batch_size: int,
+    is_train: bool,
+    relabel=False,
+    label_map=None,
+    num_workers: int = 4,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
+    prefetch_factor: int = 2,
+):
     ds = VRUDataset(samples=samples, transform=transform, relabel=relabel, label_map=label_map, max_retries=3)
+    loader_kwargs = dict(
+        pin_memory=pin_memory,
+        drop_last=is_train,
+    )
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = persistent_workers
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+
     return DataLoader(
         ds,
         batch_size=batch_size,
         shuffle=is_train,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=is_train,
+        **loader_kwargs,
     )
 
 
@@ -160,11 +187,26 @@ def main() -> None:
     set_seed(args.seed)
     configure_cuda_for_speed()
 
+    if args.grad_accum < 1:
+        raise ValueError("--grad-accum must be >= 1")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_channels_last = torch.cuda.is_available()
-    amp_dtype = choose_amp_dtype()
-    use_amp = torch.cuda.is_available()
+    use_channels_last = torch.cuda.is_available() and (not args.no_channels_last)
+    use_amp = torch.cuda.is_available() and (not args.no_amp)
+    if args.amp_dtype == "auto":
+        amp_dtype = choose_amp_dtype()
+    elif args.amp_dtype == "bf16":
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            amp_dtype = torch.bfloat16
+        else:
+            print("bf16 not supported on this GPU; falling back to fp16")
+            amp_dtype = torch.float16
+    else:
+        amp_dtype = torch.float16
     use_scaler = use_amp and amp_dtype == torch.float16
+    pin_memory = torch.cuda.is_available() and (not args.no_pin_memory)
+    persistent_workers = (not args.no_persistent_workers) and args.num_workers > 0
+    prefetch_factor = args.prefetch_factor
 
     vru_dir = args.data_root / "VRU"
     pic_dir = vru_dir / "Pic"
@@ -192,9 +234,20 @@ def main() -> None:
     batch_size = args.batch_size
     learning_rate = args.base_lr * (batch_size / args.base_batch_size)
 
-    train_loader = make_loader(train_samples, train_tfms, batch_size, True, relabel=True, label_map=train_label_map, num_workers=args.num_workers)
+    train_loader = make_loader(
+        train_samples,
+        train_tfms,
+        batch_size,
+        True,
+        relabel=True,
+        label_map=train_label_map,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+    )
 
-    model = GASNet(num_classes=num_classes).to(device)
+    model = GASNet(num_classes=num_classes, use_pretrained=not args.no_pretrained).to(device)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
 
@@ -212,7 +265,8 @@ def main() -> None:
 
     print(
         f"device={device}, amp={use_amp}, amp_dtype={amp_dtype}, channels_last={use_channels_last}, "
-        f"batch={batch_size}, lr={learning_rate:.6f}"
+        f"batch={batch_size}, lr={learning_rate:.6f}, grad_accum={args.grad_accum}, "
+        f"workers={args.num_workers}, pin_memory={pin_memory}, persistent_workers={persistent_workers}"
     )
 
     model.train()
@@ -221,6 +275,7 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         running = 0.0
         t0 = time.time()
+        optimizer.zero_grad(set_to_none=True)
         for step, (imgs, labels, _, _) in enumerate(train_loader, 1):
             if use_channels_last:
                 imgs = imgs.to(device, non_blocking=True, memory_format=torch.channels_last)
@@ -234,19 +289,32 @@ def main() -> None:
                 loss_tri = batch_hard_triplet_loss(g_feat, labels) + batch_hard_triplet_loss(f_feat, labels)
                 loss = loss_id + loss_tri
 
-            optimizer.zero_grad(set_to_none=True)
+            loss_to_backprop = loss / args.grad_accum
             if use_amp and use_scaler:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(loss_to_backprop).backward()
             else:
-                loss.backward()
-                optimizer.step()
+                loss_to_backprop.backward()
+
+            if step % args.grad_accum == 0:
+                if use_amp and use_scaler:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
             running += loss.item() * imgs.size(0)
 
             if step == 1 or step % args.log_every == 0 or step == len(train_loader):
                 print(f"  epoch {epoch} step {step}/{len(train_loader)} loss={loss.item():.4f}")
+
+        if step % args.grad_accum != 0:
+            if use_amp and use_scaler:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         epoch_loss = running / len(train_loader.dataset)
         print(f"Epoch {epoch}: loss={epoch_loss:.4f}, time={(time.time() - t0)/60:.1f} min")
@@ -259,6 +327,9 @@ def main() -> None:
                 test_transform=test_tfms,
                 batch_size=batch_size,
                 num_workers=args.num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers,
+                prefetch_factor=prefetch_factor,
                 device=device,
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
@@ -273,6 +344,9 @@ def main() -> None:
             test_transform=test_tfms,
             batch_size=batch_size,
             num_workers=args.num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
             device=device,
             use_amp=use_amp,
             amp_dtype=amp_dtype,

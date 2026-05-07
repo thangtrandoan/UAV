@@ -4,6 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -19,11 +20,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./requirements.txt
-RUN pip install --upgrade pip && \
-    pip install -r requirements.txt
+RUN python -m pip install --upgrade pip && \
+    python -m pip install -r requirements.txt
 
+COPY --chmod=755 entrypoint.sh ./
 COPY train.py dataset.py utils.py evaluate.py ./
 
 RUN mkdir -p /workspace/output /workspace/data
 
-CMD ["python", "train.py", "--data-root", "/workspace/data", "--output-dir", "/workspace/output"]
+ENTRYPOINT ["/workspace/entrypoint.sh"]

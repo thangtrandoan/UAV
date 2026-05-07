@@ -50,6 +50,11 @@ docker build -t gasnet-h100:v2 .
 
 ## 5) Run Training + Evaluation
 
+The container runs data checks, prepares environment info, trains, and evaluates on Small/Medium/Big splits at startup.
+Pass the VRU root via `--data-root` (or mount it at `/data` and omit the flag).
+Use `--output-dir` to control where the checkpoint is saved (default `/workspace/output`).
+If the target machine is offline, keep the pretrained ResNet-50 weights cached in the image (default). You can also disable pretrained weights with `--no-pretrained`.
+
 Linux/macOS:
 
 ```bash
@@ -57,7 +62,7 @@ docker run --gpus all --rm -it \
   -v /path/to/data_root:/data \
   -v /path/to/output:/workspace/output \
   trandoanthang/gasnet-h100:v2 \
-  python train.py --data-root /data --epochs 60 --batch-size 512 --run-eval --eval-every 10
+  --data-root /data --epochs 60 --batch-size 512 --eval-every 10
 ```
 
 Windows PowerShell:
@@ -67,7 +72,33 @@ docker run --gpus all --rm -it `
   -v D:\path\to\data_root:/data `
   -v D:\path\to\output:/workspace/output `
   trandoanthang/gasnet-h100:v2 `
-  python train.py --data-root /data --epochs 60 --batch-size 512 --run-eval --eval-every 10
+  --data-root /data --epochs 60 --batch-size 512 --eval-every 10
+```
+
+## 5.1) H100-Optimized Settings (Recommended)
+
+Linux/macOS:
+
+```bash
+docker run --gpus all --rm -it \
+  -v /path/to/data_root:/data \
+  -v /path/to/output:/workspace/output \
+  trandoanthang/gasnet-h100:v2 \
+  --data-root /data --epochs 60 --batch-size 512 \
+    --amp-dtype bf16 --grad-accum 1 --num-workers 8 --prefetch-factor 4 \
+    --eval-every 10
+```
+
+Windows PowerShell:
+
+```powershell
+docker run --gpus all --rm -it `
+  -v D:\path\to\data_root:/data `
+  -v D:\path\to\output:/workspace/output `
+  trandoanthang/gasnet-h100:v2 `
+  --data-root /data --epochs 60 --batch-size 512 `
+    --amp-dtype bf16 --grad-accum 1 --num-workers 8 --prefetch-factor 4 `
+    --eval-every 10
 ```
 
 ## 6) What Evaluation Prints
@@ -89,7 +120,14 @@ For each subset, it prints:
 - `--run-eval`: enable evaluation.
 - `--eval-every N`: evaluate every N epochs. Use `0` to skip periodic eval and only run final eval.
 - `--batch-size`: training batch size (default `512`).
-- `--num-workers`: DataLoader workers (default `4`).
+- `--num-workers`: DataLoader workers (default `8`).
+- `--prefetch-factor`: DataLoader prefetch factor per worker (default `4`).
+- `--grad-accum`: accumulate gradients over N steps for large effective batches.
+- `--amp-dtype`: `auto` (default), `bf16`, or `fp16`.
+- `--no-amp`: disable AMP.
+- `--no-channels-last`: disable channels-last layout.
+- `--no-pin-memory`: disable pinned memory for loaders.
+- `--no-persistent-workers`: disable persistent workers for loaders.
 - `--no-compile`: disable `torch.compile` if needed for compatibility.
 
 ## 8) Outputs

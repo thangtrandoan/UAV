@@ -388,6 +388,7 @@ def build_visdrone_train_loader(paths: Paths, batch_size: int = 16, img_size: in
         train=True,
         mosaic_prob=mosaic_prob,
     )
+    prefetch = 2 if num_workers > 0 else None
     return DataLoader(
         ds,
         batch_size=batch_size,
@@ -395,5 +396,6 @@ def build_visdrone_train_loader(paths: Paths, batch_size: int = 16, img_size: in
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=num_workers > 0,
+        prefetch_factor=prefetch,
         collate_fn=collate_fn,
     )

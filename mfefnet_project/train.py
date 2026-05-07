@@ -565,22 +565,34 @@ def export_predictions_to_coco_json(
     device: torch.device,
     img_size: int = 640,
     batch_size: int = 8,
+    num_workers: int = 0,
     conf_thres: float = 0.001,
     iou_thres: float = 0.65,
     max_det: int = 300,
     num_classes: int = 10,
+    amp_dtype: Optional[torch.dtype] = None,
 ) -> Path:
     ds = YoloTxtDataset(image_list_file=image_list_file, labels_dir=labels_dir, img_size=img_size, train=False, mosaic_prob=0.0)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn)
+    dl = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
+        collate_fn=collate_fn,
+    )
 
     image_id_map = build_image_id_map(image_list_file)
     records = []
 
     model.eval()
+    use_amp = device.type == "cuda" and amp_dtype is not None
     with torch.no_grad():
         for imgs, _, paths in dl:
             imgs = imgs.to(device)
-            preds = model(imgs)
+            with torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu", enabled=use_amp, dtype=amp_dtype):
+                preds = model(imgs)
             dets_batch = _collect_batch_dets(preds, conf_thres=conf_thres, iou_thres=iou_thres, max_det=max_det, num_classes=num_classes)
 
             for dets, p_str in zip(dets_batch, paths):
@@ -624,44 +636,70 @@ def _list_has_windows_style_paths(image_list_file: Path) -> bool:
     return False
 
 
-def evaluate_after_training(model: nn.Module, paths, output_dir: Path, device: torch.device, img_size: int, batch_size: int, num_classes: int) -> Dict[str, Dict[str, float]]:
-    val_img_list = paths.workdir / "visdrone" / "val_images.txt"
-    val_lbl_dir = paths.workdir / "visdrone" / "val" / "labels"
+def _resolve_eval_splits(raw: str) -> List[str]:
+    splits = [s.strip().lower() for s in raw.split(",") if s.strip()]
+    return [s for s in splits if s in {"val", "test"}]
 
-    if _list_has_windows_style_paths(val_img_list):
-        print("Detected stale/non-container image paths in processed lists. Rebuilding data lists...")
-        prepare_data(paths)
 
+def _get_split_paths(paths, split: str) -> Tuple[Path, Path]:
+    if split == "test":
+        return paths.workdir / "visdrone" / "test_images.txt", paths.workdir / "visdrone" / "test" / "labels"
+    return paths.workdir / "visdrone" / "val_images.txt", paths.workdir / "visdrone" / "val" / "labels"
+
+
+def evaluate_after_training(
+    model: nn.Module,
+    paths,
+    output_dir: Path,
+    device: torch.device,
+    img_size: int,
+    batch_size: int,
+    num_classes: int,
+    splits: List[str],
+    amp_dtype: Optional[torch.dtype] = None,
+) -> Dict[str, Dict[str, float]]:
     eval_dir = ensure_dir(output_dir / "eval")
-    gt_json = eval_dir / "visdrone_val_gt_coco.json"
-    pred_json = eval_dir / "visdrone_val_pred_coco.json"
-    metrics_json = eval_dir / "metrics.json"
+    results: Dict[str, Dict[str, float]] = {}
 
-    build_coco_gt_from_yolo(val_img_list, val_lbl_dir, VISDRONE_NAMES, gt_json)
-    export_predictions_to_coco_json(
-        model=model,
-        image_list_file=val_img_list,
-        labels_dir=val_lbl_dir,
-        output_json=pred_json,
-        device=device,
-        img_size=img_size,
-        batch_size=max(1, min(8, batch_size)),
-        num_classes=num_classes,
-    )
+    for split in splits:
+        img_list, lbl_dir = _get_split_paths(paths, split)
+        if _list_has_windows_style_paths(img_list):
+            print("Detected stale/non-container image paths in processed lists. Rebuilding data lists...")
+            prepare_data(paths)
 
-    gt_obj = json.loads(gt_json.read_text(encoding="utf-8"))
-    pred_obj = json.loads(pred_json.read_text(encoding="utf-8"))
-    basic_metrics = compute_basic_detection_metrics(gt_records=gt_obj.get("annotations", []), pred_records=pred_obj, iou_thres=0.5)
+        gt_json = eval_dir / f"visdrone_{split}_gt_coco.json"
+        pred_json = eval_dir / f"visdrone_{split}_pred_coco.json"
+        metrics_json = eval_dir / f"metrics_{split}.json"
 
-    result: Dict[str, Dict[str, float]] = {"basic": basic_metrics}
-    try:
-        result["coco"] = evaluate_coco_metrics(gt_json, pred_json)
-    except Exception as exc:
-        print(f"COCO evaluation skipped due to error: {exc}")
+        build_coco_gt_from_yolo(img_list, lbl_dir, VISDRONE_NAMES, gt_json)
+        export_predictions_to_coco_json(
+            model=model,
+            image_list_file=img_list,
+            labels_dir=lbl_dir,
+            output_json=pred_json,
+            device=device,
+            img_size=img_size,
+            batch_size=max(1, min(8, batch_size)),
+            num_classes=num_classes,
+            num_workers=min(4, max(0, batch_size // 2)),
+            amp_dtype=amp_dtype,
+        )
 
-    metrics_json.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("Evaluation results saved to:", metrics_json)
-    return result
+        gt_obj = json.loads(gt_json.read_text(encoding="utf-8"))
+        pred_obj = json.loads(pred_json.read_text(encoding="utf-8"))
+        basic_metrics = compute_basic_detection_metrics(gt_records=gt_obj.get("annotations", []), pred_records=pred_obj, iou_thres=0.5)
+
+        result: Dict[str, Dict[str, float]] = {"basic": basic_metrics}
+        try:
+            result["coco"] = evaluate_coco_metrics(gt_json, pred_json)
+        except Exception as exc:
+            print(f"COCO evaluation skipped due to error: {exc}")
+
+        metrics_json.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("Evaluation results saved to:", metrics_json)
+        results[split] = result
+
+    return results
 
 
 def train_one_epoch(
@@ -673,18 +711,22 @@ def train_one_epoch(
     scheduler=None,
     device: torch.device = torch.device("cpu"),
     max_steps: Optional[int] = None,
+    amp_dtype: Optional[torch.dtype] = None,
+    channels_last: bool = False,
 ) -> Dict[str, float]:
     model.train()
-    use_amp = device.type == "cuda"
+    use_amp = device.type == "cuda" and amp_dtype is not None
     autocast_device = "cuda" if use_amp else "cpu"
 
     sum_loss, sum_box, sum_cls, sum_obj, steps = 0.0, 0.0, 0.0, 0.0, 0
     for imgs, targets, _ in loader:
         imgs = imgs.to(device, non_blocking=True)
+        if channels_last:
+            imgs = imgs.to(memory_format=torch.channels_last)
         targets = [t.to(device) for t in targets]
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast(device_type=autocast_device, enabled=use_amp):
+        with torch.amp.autocast(device_type=autocast_device, enabled=use_amp, dtype=amp_dtype):
             preds = model(imgs)
             loss_dict = loss_fn(preds, targets)
 
@@ -728,8 +770,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=640)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--h100-preset", action="store_true", help="Use recommended settings for H100 training")
+    parser.add_argument("--amp-dtype", type=str, default="auto", choices=["auto", "bf16", "fp16"], help="AMP dtype for CUDA")
+    parser.add_argument("--channels-last", action="store_true", help="Use channels_last memory format for CNN speed")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile for faster training/inference")
+    parser.add_argument("--compile-mode", type=str, default="max-autotune", help="torch.compile mode (e.g., max-autotune, reduce-overhead)")
     parser.add_argument("--prepare-data", action="store_true", help="Convert raw annotations to YOLO labels before training")
     parser.add_argument("--skip-eval", action="store_true", help="Skip automatic evaluation after training")
+    parser.add_argument("--eval-splits", type=str, default="val", help="Comma-separated splits to evaluate: val,test")
+    parser.add_argument("--eval-best", action=argparse.BooleanOptionalAction, default=True, help="Reload best checkpoint before evaluation")
     parser.add_argument("--max-steps-per-epoch", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--base", type=int, default=32)
@@ -745,6 +793,10 @@ def main() -> None:
 
     device = choose_device(args.device)
     amp_dtype = choose_amp_dtype()
+    if args.amp_dtype == "bf16":
+        amp_dtype = torch.bfloat16
+    elif args.amp_dtype == "fp16":
+        amp_dtype = torch.float16
     print(f"device={device}, amp_dtype={amp_dtype}")
 
     cfg = TrainConfig(
@@ -780,9 +832,13 @@ def main() -> None:
     )
 
     model = MFEFNet(num_classes=args.classes, base=args.base, neck_c=args.neck_c).to(device)
+    if args.channels_last:
+        model = model.to(memory_format=torch.channels_last)
+    if args.compile and hasattr(torch, "compile"):
+        model = torch.compile(model, mode=args.compile_mode)
     optimizer = build_optimizer(model, cfg)
     loss_fn = MFEFNetLoss(num_classes=args.classes, img_size=cfg.img_size)
-    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and amp_dtype == torch.float16))
     scheduler = build_scheduler(optimizer, cfg, steps_per_epoch=max(1, len(loader)))
 
     best_loss = float("inf")
@@ -804,6 +860,8 @@ def main() -> None:
             scheduler=scheduler,
             device=device,
             max_steps=max_steps,
+            amp_dtype=amp_dtype,
+            channels_last=args.channels_last,
         )
 
         if log["loss"] < best_loss:
@@ -830,6 +888,14 @@ def main() -> None:
     print(f"Training done in {dt_min:.1f} min. Best checkpoint: {ckpt_path}")
 
     if not args.skip_eval:
+        if args.eval_best and ckpt_path.exists():
+            state = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(state.get("model_state_dict", state))
+            print(f"Loaded best checkpoint for evaluation: {ckpt_path}")
+
+        splits = _resolve_eval_splits(args.eval_splits)
+        if not splits:
+            splits = ["val"]
         metrics = evaluate_after_training(
             model=model,
             paths=paths,
@@ -838,10 +904,13 @@ def main() -> None:
             img_size=cfg.img_size,
             batch_size=cfg.batch_size,
             num_classes=args.classes,
+            splits=splits,
+            amp_dtype=amp_dtype,
         )
-        print("Basic eval:", metrics.get("basic", {}))
-        if "coco" in metrics:
-            print("COCO eval:", metrics["coco"])
+        for split, result in metrics.items():
+            print(f"Basic eval ({split}):", result.get("basic", {}))
+            if "coco" in result:
+                print(f"COCO eval ({split}):", result["coco"])
 
 
 if __name__ == "__main__":
