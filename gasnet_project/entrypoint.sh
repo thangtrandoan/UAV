@@ -81,6 +81,36 @@ for p in (train_list, small, medium, big):
     print(f"{p.name}: {count} lines")
 PY
 
+TORCH_HOME_DIR="${TORCH_HOME:-/opt/torch_cache}"
+WEIGHT_FILE="$TORCH_HOME_DIR/hub/checkpoints/resnet50-11ad3fa6.pth"
+HAS_NO_PRETRAINED=0
+for arg in "${EXTRA_ARGS[@]}"; do
+  if [[ "$arg" == "--no-pretrained" ]]; then
+    HAS_NO_PRETRAINED=1
+    break
+  fi
+done
+
+if [[ ! -f "$WEIGHT_FILE" && $HAS_NO_PRETRAINED -eq 0 ]]; then
+  echo "ResNet-50 weights not found at $WEIGHT_FILE; falling back to --no-pretrained." >&2
+  EXTRA_ARGS+=("--no-pretrained")
+fi
+
+HAS_NO_COMPILE=0
+for arg in "${EXTRA_ARGS[@]}"; do
+  if [[ "$arg" == "--no-compile" ]]; then
+    HAS_NO_COMPILE=1
+    break
+  fi
+done
+
+if [[ $HAS_NO_COMPILE -eq 0 ]]; then
+  if ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+    echo "No compiler found; falling back to --no-compile." >&2
+    EXTRA_ARGS+=("--no-compile")
+  fi
+fi
+
 python /workspace/gasnet_project/train.py \
   --data-root "$DATA_ROOT" \
   --save-path "$OUTPUT_DIR/gasnet_vru.pth" \

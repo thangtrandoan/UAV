@@ -1,3 +1,9 @@
-numpy>=1.24
-pillow>=10.0
-# torch/torchvision are already available in the chosen base image
+numpy==1.26.4
+Pillow==10.3.0
+
+# Install CUDA wheels with extra index:
+#   pip install --index-url https://download.pytorch.org/whl/cu121 -r requirements.txt
+# For offline installs, download the CUDA wheels and use:
+#   pip install --no-index --find-links /path/to/wheels -r requirements.txt
+torch==2.3.1
+torchvision==0.18.1
