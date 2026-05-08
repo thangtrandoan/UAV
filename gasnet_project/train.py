@@ -23,6 +23,10 @@ BEST_METRIC_SPLIT_PRIORITY = {
 }
 
 
+def _concat_relation(relation: torch.Tensor) -> torch.Tensor:
+    return torch.cat([relation, relation.transpose(1, 2)], dim=1)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train GASNet on VRU")
     parser.add_argument("--data-root", type=Path, required=True, help="Path containing VRU folder")
@@ -112,10 +116,10 @@ class RGASpatial(nn.Module):
         theta = self.theta(x).view(b, -1, self.num_nodes).transpose(1, 2)
         phi = self.phi(x).view(b, -1, self.num_nodes)
         spatial_relation = torch.bmm(theta, phi)
-        relation = torch.cat([spatial_relation, spatial_relation.transpose(1, 2)], dim=1)
+        relation = _concat_relation(spatial_relation)
         relation = self.relation(relation)
-        channel_pooled = self.g(x).flatten(2).mean(dim=1, keepdim=True)
-        attn = self.attn(torch.cat([relation, channel_pooled], dim=1))
+        spatial_pooled = self.g(x).flatten(2).mean(dim=1, keepdim=True)
+        attn = self.attn(torch.cat([relation, spatial_pooled], dim=1))
         attn = self.sigmoid(attn).view(b, 1, h, w)
         return x * attn
 
@@ -173,10 +177,10 @@ class RGAChannel(nn.Module):
         theta = self.theta(x_perm).permute(0, 2, 1)
         phi = self.phi(x_perm)
         channel_relation = torch.bmm(theta, phi)
-        relation = torch.cat([channel_relation, channel_relation.transpose(1, 2)], dim=1)
+        relation = _concat_relation(channel_relation)
         relation = self.relation(relation)
-        spatial_pooled = self.channel_embed(x).mean(dim=(2, 3)).unsqueeze(1)
-        attn = self.attn(torch.cat([relation, spatial_pooled], dim=1))
+        channel_pooled = self.channel_embed(x).mean(dim=(2, 3)).unsqueeze(1)
+        attn = self.attn(torch.cat([relation, channel_pooled], dim=1))
         attn = self.sigmoid(attn).view(b, c, 1, 1)
         return x * attn
 
