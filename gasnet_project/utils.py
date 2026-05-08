@@ -46,14 +46,12 @@ def evaluate_map_cmc(
     if q_chunk_size < 1:
         raise ValueError("q_chunk_size must be >= 1")
 
-    if query_feats.device == gallery_feats.device:
-        device = query_feats.device
-    elif query_feats.is_cuda:
+    if query_feats.is_cuda:
         device = query_feats.device
     elif gallery_feats.is_cuda:
         device = gallery_feats.device
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = query_feats.device
 
     q = F.normalize(query_feats.to(device=device, dtype=torch.float32, non_blocking=True), dim=1)
     g = F.normalize(gallery_feats.to(device=device, dtype=torch.float32, non_blocking=True), dim=1)
@@ -105,7 +103,7 @@ def evaluate_map_cmc(
     cmc = cmc / num_q
     mAP = (ap_sum / ap_count) if ap_count > 0 else 0.0
     r1 = float(cmc[topk[0] - 1].item())
-    r5 = float(cmc[topk[1] - 1].item()) if max_k >= 5 else 0.0
+    r5 = float(cmc[topk[1] - 1].item()) if topk[1] <= max_k else 0.0
     return mAP, r1, r5
 
 
@@ -146,7 +144,7 @@ def self_check_evaluate_map_cmc() -> Tuple[float, float, float]:
         cmc_ref = cmc_ref / num_q_ref
         m_ap_ref = float(np.mean(ap_list_ref)) if ap_list_ref else 0.0
         r1_ref = float(cmc_ref[tk[0] - 1].item())
-        r5_ref = float(cmc_ref[tk[1] - 1].item()) if max_k_ref >= 5 else 0.0
+        r5_ref = float(cmc_ref[tk[1] - 1].item()) if tk[1] <= max_k_ref else 0.0
         return m_ap_ref, r1_ref, r5_ref
 
     torch.manual_seed(42)

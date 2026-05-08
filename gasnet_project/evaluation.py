@@ -66,7 +66,7 @@ def _extract_features(
         else:
             imgs = imgs.to(device, non_blocking=True)
 
-        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")):
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")):
             _, (bn_global, bn_fs) = model(imgs)
             emb = torch.cat([bn_global, bn_fs], dim=1)
 
