@@ -216,6 +216,22 @@ def _select_metric(
     return None, None
 
 
+def _maybe_update_best_checkpoint(
+    model: nn.Module,
+    metrics_by_split: dict,
+    best_metric: str,
+    epoch: int,
+    best_score: float | None,
+    best_path: Path,
+) -> tuple[float | None, int | None, str | None]:
+    metric_value, metric_split = _select_metric(metrics_by_split, best_metric)
+    if metric_value is not None and (best_score is None or metric_value > best_score):
+        torch.save(model.state_dict(), best_path)
+        print(f"Updated best checkpoint at epoch {epoch}: {metric_split} mAP={metric_value:.4f} -> {best_path}")
+        return metric_value, epoch, metric_split
+    return best_score, None, None
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -241,7 +257,10 @@ def main() -> None:
     pin_memory = torch.cuda.is_available() and (not args.no_pin_memory)
     persistent_workers = (not args.no_persistent_workers) and args.num_workers > 0
     prefetch_factor = args.prefetch_factor
-    save_best = args.run_eval and (args.save_best if args.save_best is not None else True)
+    if args.save_best is None:
+        save_best = args.run_eval
+    else:
+        save_best = args.run_eval and args.save_best
 
     vru_dir = args.data_root / "VRU"
     pic_dir = vru_dir / "Pic"
@@ -309,8 +328,9 @@ def main() -> None:
     best_score = None
     best_epoch = None
     best_split = None
-    best_path = _best_checkpoint_path(args.save_path)
+    best_path = None
     if save_best:
+        best_path = _best_checkpoint_path(args.save_path)
         best_path.parent.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, args.epochs + 1):
@@ -381,13 +401,17 @@ def main() -> None:
             )
             print_eval_report(metrics, title=f"Evaluation @ Epoch {epoch}")
             if save_best:
-                metric_value, metric_split = _select_metric(metrics, args.best_metric)
-                if metric_value is not None and (best_score is None or metric_value > best_score):
-                    best_score = metric_value
-                    best_epoch = epoch
-                    best_split = metric_split
-                    torch.save(model.state_dict(), best_path)
-                    print(f"Updated best checkpoint at epoch {epoch}: {metric_split} mAP={metric_value:.4f} -> {best_path}")
+                best_score, maybe_best_epoch, maybe_best_split = _maybe_update_best_checkpoint(
+                    model=model,
+                    metrics_by_split=metrics,
+                    best_metric=args.best_metric,
+                    epoch=epoch,
+                    best_score=best_score,
+                    best_path=best_path,
+                )
+                if maybe_best_epoch is not None:
+                    best_epoch = maybe_best_epoch
+                    best_split = maybe_best_split
 
     if args.run_eval:
         metrics = run_eval(
@@ -409,13 +433,17 @@ def main() -> None:
         )
         print_eval_report(metrics, title="Final Evaluation")
         if save_best:
-            metric_value, metric_split = _select_metric(metrics, args.best_metric)
-            if metric_value is not None and (best_score is None or metric_value > best_score):
-                best_score = metric_value
-                best_epoch = args.epochs
-                best_split = metric_split
-                torch.save(model.state_dict(), best_path)
-                print(f"Updated best checkpoint at epoch {args.epochs}: {metric_split} mAP={metric_value:.4f} -> {best_path}")
+            best_score, maybe_best_epoch, maybe_best_split = _maybe_update_best_checkpoint(
+                model=model,
+                metrics_by_split=metrics,
+                best_metric=args.best_metric,
+                epoch=args.epochs,
+                best_score=best_score,
+                best_path=best_path,
+            )
+            if maybe_best_epoch is not None:
+                best_epoch = maybe_best_epoch
+                best_split = maybe_best_split
 
     args.save_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), args.save_path)
