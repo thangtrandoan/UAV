@@ -118,13 +118,22 @@ class GASNet(nn.Module):
         super().__init__()
         weights = models.ResNet50_Weights.DEFAULT if use_pretrained else None
         base = models.resnet50(weights=weights)
+        
         self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
+        
         self.layer1 = base.layer1
         self.layer2 = base.layer2
         self.layer3 = base.layer3
         self.layer4 = base.layer4
-        self.ga_blocks = nn.ModuleList([RGABlock(512) for _ in range(len(self.layer2))])
-        self.fs = AggregationGate(1024, 512)
+        
+        self.ga1 = RGABlock(256)
+        self.ga2 = RGABlock(512)
+        self.ga3 = RGABlock(1024)
+        self.ga4 = RGABlock(2048)
+        
+        self.fs1 = AggregationGate(1024, 512)
+        self.fs2 = AggregationGate(512, 512)
+        
         self.gap = nn.AdaptiveAvgPool2d(1)
         self.bnneck_global = nn.BatchNorm1d(2048)
         self.bnneck_fs = nn.BatchNorm1d(512)
@@ -134,11 +143,18 @@ class GASNet(nn.Module):
     def forward(self, x: torch.Tensor):
         x = self.stem(x)
         x = self.layer1(x)
-        for block, ga in zip(self.layer2, self.ga_blocks):
-            x = ga(block(x))
+        x = self.ga1(x)
+
+        x = self.layer2(x)
+        x = self.ga2(x)
+
         x = self.layer3(x)
-        fs = self.fs(x)
+        fs = self.fs1(x)
+        fs = self.fs2(fs)
+        x = self.ga3(x)
+
         x = self.layer4(x)
+        x = self.ga4(x)
 
         global_feat = self.gap(x).flatten(1)
         fs_feat = self.gap(fs).flatten(1)
