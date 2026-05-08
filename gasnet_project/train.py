@@ -241,7 +241,7 @@ def main() -> None:
     pin_memory = torch.cuda.is_available() and (not args.no_pin_memory)
     persistent_workers = (not args.no_persistent_workers) and args.num_workers > 0
     prefetch_factor = args.prefetch_factor
-    save_best = args.run_eval and (True if args.save_best is None else args.save_best)
+    save_best = args.run_eval and (args.save_best if args.save_best is not None else True)
 
     vru_dir = args.data_root / "VRU"
     pic_dir = vru_dir / "Pic"
@@ -310,6 +310,8 @@ def main() -> None:
     best_epoch = None
     best_split = None
     best_path = _best_checkpoint_path(args.save_path)
+    if save_best:
+        best_path.parent.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, args.epochs + 1):
         running = 0.0
@@ -384,7 +386,6 @@ def main() -> None:
                     best_score = metric_value
                     best_epoch = epoch
                     best_split = metric_split
-                    best_path.parent.mkdir(parents=True, exist_ok=True)
                     torch.save(model.state_dict(), best_path)
                     print(f"Updated best checkpoint at epoch {epoch}: {metric_split} mAP={metric_value:.4f} -> {best_path}")
 
@@ -413,7 +414,6 @@ def main() -> None:
                 best_score = metric_value
                 best_epoch = args.epochs
                 best_split = metric_split
-                best_path.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(model.state_dict(), best_path)
                 print(f"Updated best checkpoint at epoch {args.epochs}: {metric_split} mAP={metric_value:.4f} -> {best_path}")
 
