@@ -16,6 +16,13 @@ from evaluation import print_eval_report, run_eval
 from utils import choose_amp_dtype, configure_cuda_for_speed, set_seed
 
 
+BEST_METRIC_SPLIT_PRIORITY = {
+    "big_map": ("Big", "Medium", "Small"),
+    "medium_map": ("Medium", "Big", "Small"),
+    "small_map": ("Small", "Medium", "Big"),
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train GASNet on VRU")
     parser.add_argument("--data-root", type=Path, required=True, help="Path containing VRU folder")
@@ -33,6 +40,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-eval", action="store_true", help="Run retrieval evaluation on Small/Medium/Big test splits")
     parser.add_argument("--eval-every", type=int, default=0, help="Run evaluation every N epochs (0 = only final eval if --run-eval)")
+    parser.add_argument("--save-best", dest="save_best", action="store_true", help="Save best checkpoint when evaluation runs")
+    parser.add_argument("--no-save-best", dest="save_best", action="store_false", help="Disable best-checkpoint saving")
+    parser.set_defaults(save_best=None)
+    parser.add_argument(
+        "--best-metric",
+        choices=("big_map", "medium_map", "small_map"),
+        default="big_map",
+        help="Metric used to select the best checkpoint (fallback order depends on selected split)",
+    )
     parser.add_argument("--amp-dtype", choices=["auto", "bf16", "fp16"], default="auto")
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--no-channels-last", action="store_true")
@@ -185,6 +201,21 @@ def make_loader(
     )
 
 
+def _best_checkpoint_path(save_path: Path) -> Path:
+    return save_path.with_name(f"{save_path.stem}.best{save_path.suffix}")
+
+
+def _select_metric(
+    metrics_by_split: dict,
+    best_metric: str,
+) -> tuple[float, str] | tuple[None, None]:
+    for split_name in BEST_METRIC_SPLIT_PRIORITY[best_metric]:
+        split_metrics = metrics_by_split.get(split_name)
+        if split_metrics is not None:
+            return float(split_metrics[0]), split_name
+    return None, None
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -210,6 +241,7 @@ def main() -> None:
     pin_memory = torch.cuda.is_available() and (not args.no_pin_memory)
     persistent_workers = (not args.no_persistent_workers) and args.num_workers > 0
     prefetch_factor = args.prefetch_factor
+    save_best = args.run_eval and (True if args.save_best is None else args.save_best)
 
     vru_dir = args.data_root / "VRU"
     pic_dir = vru_dir / "Pic"
@@ -274,6 +306,10 @@ def main() -> None:
 
     model.train()
     ce_loss = nn.CrossEntropyLoss()
+    best_score = None
+    best_epoch = None
+    best_split = None
+    best_path = _best_checkpoint_path(args.save_path)
 
     for epoch in range(1, args.epochs + 1):
         running = 0.0
@@ -342,6 +378,15 @@ def main() -> None:
                 verbose_eval=args.eval_verbose,
             )
             print_eval_report(metrics, title=f"Evaluation @ Epoch {epoch}")
+            if save_best:
+                metric_value, metric_split = _select_metric(metrics, args.best_metric)
+                if metric_value is not None and (best_score is None or metric_value > best_score):
+                    best_score = metric_value
+                    best_epoch = epoch
+                    best_split = metric_split
+                    best_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(model.state_dict(), best_path)
+                    print(f"Updated best checkpoint at epoch {epoch}: {metric_split} mAP={metric_value:.4f} -> {best_path}")
 
     if args.run_eval:
         metrics = run_eval(
@@ -362,10 +407,24 @@ def main() -> None:
             verbose_eval=args.eval_verbose,
         )
         print_eval_report(metrics, title="Final Evaluation")
+        if save_best:
+            metric_value, metric_split = _select_metric(metrics, args.best_metric)
+            if metric_value is not None and (best_score is None or metric_value > best_score):
+                best_score = metric_value
+                best_epoch = args.epochs
+                best_split = metric_split
+                best_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(model.state_dict(), best_path)
+                print(f"Updated best checkpoint at epoch {args.epochs}: {metric_split} mAP={metric_value:.4f} -> {best_path}")
 
     args.save_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), args.save_path)
     print(f"Saved model to {args.save_path}")
+    if save_best:
+        if best_score is not None:
+            print(f"Best checkpoint summary: epoch={best_epoch}, split={best_split}, mAP={best_score:.4f}, path={best_path}")
+        else:
+            print("Best checkpoint summary: no evaluation metrics available, best checkpoint not saved")
 
 
 if __name__ == "__main__":
