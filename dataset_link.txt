@@ -6,3 +6,5 @@ https://www.kaggle.com/datasets/kushagrapandya/visdrone-dataset
 
 3. UAVDT
 https://datasetninja.com/uavdt
+
+https://chatgpt.com/share/e/69fda57a-f6a8-800f-92f3-343be9fe7a52
