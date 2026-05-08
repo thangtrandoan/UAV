@@ -115,6 +115,8 @@ For each subset, it prints:
 - `Rank-1`
 - `Rank-5`
 
+For the `Big` split, evaluation now runs in query chunks instead of materializing a full query×gallery matrix. This reduces peak memory and avoids long "no output" periods. Enable `--eval-verbose` to print chunk progress.
+
 ## 7) Important Arguments
 
 - `--run-eval`: enable evaluation.
@@ -129,6 +131,9 @@ For each subset, it prints:
 - `--no-pin-memory`: disable pinned memory for loaders.
 - `--no-persistent-workers`: disable persistent workers for loaders.
 - `--no-compile`: disable `torch.compile` if needed for compatibility.
+- `--eval-q-chunk-size`: query block size used by chunked retrieval evaluation (default `2048`).
+- `--no-fp16-sim`: disable bf16/fp16 similarity matmul during evaluation.
+- `--eval-verbose`: print progress while evaluating `Big` split.
 
 ## 8) Outputs
 

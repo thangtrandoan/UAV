@@ -52,9 +52,13 @@ def _extract_features(
     use_amp: bool,
     amp_dtype: torch.dtype,
     use_channels_last: bool,
+    output_device: torch.device | str = "cpu",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     feats = []
     ids = []
+    out_device = torch.device(output_device)
+    if out_device.type == "cuda" and not torch.cuda.is_available():
+        out_device = torch.device("cpu")
 
     for imgs, _, vehicle_ids, _ in loader:
         if use_channels_last:
@@ -62,12 +66,16 @@ def _extract_features(
         else:
             imgs = imgs.to(device, non_blocking=True)
 
-        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+        autocast_kwargs = dict(device_type=device.type, enabled=(use_amp and device.type == "cuda"))
+        if device.type == "cuda":
+            autocast_kwargs["dtype"] = amp_dtype
+
+        with torch.autocast(**autocast_kwargs):
             _, (bn_global, bn_fs) = model(imgs)
             emb = torch.cat([bn_global, bn_fs], dim=1)
 
-        feats.append(emb.float().cpu())
-        ids.append(vehicle_ids.cpu())
+        feats.append(emb.float().to(out_device, non_blocking=(out_device.type == "cuda")))
+        ids.append(vehicle_ids.to(out_device, non_blocking=(out_device.type == "cuda")))
 
     return torch.cat(feats, dim=0), torch.cat(ids, dim=0)
 
@@ -86,6 +94,9 @@ def run_eval(
     use_amp: bool,
     amp_dtype: torch.dtype,
     use_channels_last: bool,
+    q_chunk_size: int = 2048,
+    use_fp16_sim: bool = True,
+    verbose_eval: bool = False,
 ) -> Dict[str, Tuple[float, float, float]]:
     vru_dir = data_root / "VRU"
     pic_dir = vru_dir / "Pic"
@@ -119,10 +130,36 @@ def run_eval(
             prefetch_factor,
         )
 
-        q_feat, q_ids = _extract_features(model, q_loader, device, use_amp, amp_dtype, use_channels_last)
-        g_feat, g_ids = _extract_features(model, g_loader, device, use_amp, amp_dtype, use_channels_last)
+        feat_out_device = device
+        q_feat, q_ids = _extract_features(
+            model,
+            q_loader,
+            device,
+            use_amp,
+            amp_dtype,
+            use_channels_last,
+            output_device=feat_out_device,
+        )
+        g_feat, g_ids = _extract_features(
+            model,
+            g_loader,
+            device,
+            use_amp,
+            amp_dtype,
+            use_channels_last,
+            output_device=feat_out_device,
+        )
 
-        m_ap, rank1, rank5 = evaluate_map_cmc(q_feat, q_ids, g_feat, g_ids, topk=(1, 5))
+        m_ap, rank1, rank5 = evaluate_map_cmc(
+            q_feat,
+            q_ids,
+            g_feat,
+            g_ids,
+            topk=(1, 5),
+            q_chunk_size=q_chunk_size,
+            use_fp16_sim=use_fp16_sim,
+            verbose=(verbose_eval and split_name == "Big"),
+        )
         metrics_by_split[split_name] = (m_ap, rank1, rank5)
 
     if was_training:
