@@ -68,15 +68,16 @@ def evaluate_map_cmc(
     sim_dtype = None
     if device.type == "cuda" and use_fp16_sim:
         sim_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    needs_float_sim = sim_dtype is not None
     q_mm = q.to(sim_dtype) if sim_dtype is not None else q
     g_mm = g.to(sim_dtype) if sim_dtype is not None else g
 
-    positions = None
+    positions = torch.arange(1, num_g + 1, device=device, dtype=torch.float32).unsqueeze(0)
 
     for start in range(0, num_q, q_chunk_size):
         end = min(start + q_chunk_size, num_q)
         sim = q_mm[start:end] @ g_mm.t()
-        if sim.dtype != torch.float32:
+        if needs_float_sim:
             sim = sim.float()
 
         order = torch.argsort(sim, dim=1, descending=True)
@@ -92,8 +93,6 @@ def evaluate_map_cmc(
                 cmc += torch.flip(torch.cumsum(torch.flip(counts, dims=[0]), dim=0), dims=[0])
 
             valid_matches = matches[has_match].to(torch.float32)
-            if positions is None:
-                positions = torch.arange(1, num_g + 1, device=device, dtype=torch.float32).unsqueeze(0)
             precision = torch.cumsum(valid_matches, dim=1) / positions
             ap = (precision * valid_matches).sum(dim=1) / valid_matches.sum(dim=1)
             ap_sum += ap.sum().item()
