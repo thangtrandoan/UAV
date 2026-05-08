@@ -38,6 +38,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-channels-last", action="store_true")
     parser.add_argument("--no-pretrained", action="store_true", help="Disable pretrained ResNet-50 weights")
     parser.add_argument("--no-compile", action="store_true")
+    parser.add_argument("--eval-q-chunk-size", type=int, default=2048, help="Query chunk size for retrieval evaluation")
+    parser.add_argument("--no-fp16-sim", action="store_true", help="Disable fp16/bf16 similarity matmul during evaluation")
+    parser.add_argument("--eval-verbose", action="store_true", help="Print progress while evaluating the Big split")
     return parser.parse_args()
 
 
@@ -334,6 +337,9 @@ def main() -> None:
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
                 use_channels_last=use_channels_last,
+                q_chunk_size=args.eval_q_chunk_size,
+                use_fp16_sim=(not args.no_fp16_sim),
+                verbose_eval=args.eval_verbose,
             )
             print_eval_report(metrics, title=f"Evaluation @ Epoch {epoch}")
 
@@ -351,6 +357,9 @@ def main() -> None:
             use_amp=use_amp,
             amp_dtype=amp_dtype,
             use_channels_last=use_channels_last,
+            q_chunk_size=args.eval_q_chunk_size,
+            use_fp16_sim=(not args.no_fp16_sim),
+            verbose_eval=args.eval_verbose,
         )
         print_eval_report(metrics, title="Final Evaluation")
 
