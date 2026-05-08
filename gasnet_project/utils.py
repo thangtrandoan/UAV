@@ -71,7 +71,7 @@ def evaluate_map_cmc(
     q_mm = q.to(sim_dtype) if sim_dtype is not None else q
     g_mm = g.to(sim_dtype) if sim_dtype is not None else g
 
-    positions = torch.arange(1, num_g + 1, device=device, dtype=torch.float32).unsqueeze(0)
+    positions = None
 
     for start in range(0, num_q, q_chunk_size):
         end = min(start + q_chunk_size, num_q)
@@ -92,10 +92,12 @@ def evaluate_map_cmc(
                 cmc += torch.flip(torch.cumsum(torch.flip(counts, dims=[0]), dim=0), dims=[0])
 
             valid_matches = matches[has_match].to(torch.float32)
+            if positions is None:
+                positions = torch.arange(1, num_g + 1, device=device, dtype=torch.float32).unsqueeze(0)
             precision = torch.cumsum(valid_matches, dim=1) / positions
             ap = (precision * valid_matches).sum(dim=1) / valid_matches.sum(dim=1)
-            ap_sum += float(ap.sum().item())
-            ap_count += int(ap.numel())
+            ap_sum += ap.sum().item()
+            ap_count += ap.numel()
 
         if verbose:
             print(f"[eval] processed queries: {end}/{num_q}")
