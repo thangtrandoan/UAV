@@ -134,14 +134,19 @@ For the `Big` split, evaluation now runs in query chunks instead of materializin
 - `--eval-q-chunk-size`: query block size used by chunked retrieval evaluation (default `2048`).
 - `--no-fp16-sim`: disable bf16/fp16 similarity matmul during evaluation.
 - `--eval-verbose`: print progress while evaluating `Big` split.
+- `--save-best` / `--no-save-best`: enable/disable saving `*.best.pth` when eval runs (enabled by default with `--run-eval`).
+- `--best-metric`: metric for best checkpoint selection (`big_map` default, `medium_map`, `small_map`).
 
 ## 8) Outputs
 
 Default checkpoint path inside container:
 
 - `/workspace/output/gasnet_vru.pth`
+- `/workspace/output/gasnet_vru.best.pth` (best checkpoint, when `--run-eval` and best saving is enabled)
 
-Because `/workspace/output` is mounted to host, checkpoint and logs remain on host after container exits.
+Evaluation metrics are printed to stdout/stderr (redirect logs if you want to persist them to a file).
+
+Because `/workspace/output` is mounted to host, checkpoints and redirected logs remain on host after container exits.
 
 ## 9) Quick Handoff Checklist
 
