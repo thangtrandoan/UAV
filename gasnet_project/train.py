@@ -105,14 +105,17 @@ class RGASpatial(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, _, h, w = x.shape
         if h * w != self.num_nodes:
-            raise ValueError(f"RGASpatial expects spatial size {self.spatial_size}, got {(h, w)}")
+            raise ValueError(
+                f"Expected spatial dimensions {self.spatial_size} (total={self.num_nodes} nodes), "
+                f"but got {(h, w)} (total={h * w} nodes)"
+            )
         theta = self.theta(x).view(b, -1, self.num_nodes).transpose(1, 2)
         phi = self.phi(x).view(b, -1, self.num_nodes)
-        rs = torch.bmm(theta, phi)
-        relation = torch.cat([rs, rs.transpose(1, 2)], dim=1)
+        spatial_relation = torch.bmm(theta, phi)
+        relation = torch.cat([spatial_relation, spatial_relation.transpose(1, 2)], dim=1)
         relation = self.relation(relation)
-        spatial_context = self.g(x).flatten(2).mean(dim=1, keepdim=True)
-        attn = self.attn(torch.cat([relation, spatial_context], dim=1))
+        channel_pooled = self.g(x).flatten(2).mean(dim=1, keepdim=True)
+        attn = self.attn(torch.cat([relation, channel_pooled], dim=1))
         attn = self.sigmoid(attn).view(b, 1, h, w)
         return x * attn
 
@@ -161,16 +164,19 @@ class RGAChannel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
         if h * w != self.num_nodes:
-            raise ValueError(f"RGAChannel expects spatial size {self.spatial_size}, got {(h, w)}")
+            raise ValueError(
+                f"Expected spatial dimensions {self.spatial_size} (total={self.num_nodes} nodes), "
+                f"but got {(h, w)} (total={h * w} nodes)"
+            )
         x_flat = x.view(b, c, self.num_nodes)
         x_perm = x_flat.permute(0, 2, 1)
         theta = self.theta(x_perm).permute(0, 2, 1)
         phi = self.phi(x_perm)
-        rc = torch.bmm(theta, phi)
-        relation = torch.cat([rc, rc.transpose(1, 2)], dim=1)
+        channel_relation = torch.bmm(theta, phi)
+        relation = torch.cat([channel_relation, channel_relation.transpose(1, 2)], dim=1)
         relation = self.relation(relation)
-        channel_context = self.channel_embed(x).mean(dim=(2, 3)).unsqueeze(1)
-        attn = self.attn(torch.cat([relation, channel_context], dim=1))
+        spatial_pooled = self.channel_embed(x).mean(dim=(2, 3)).unsqueeze(1)
+        attn = self.attn(torch.cat([relation, spatial_pooled], dim=1))
         attn = self.sigmoid(attn).view(b, c, 1, 1)
         return x * attn
 
