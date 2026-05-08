@@ -111,8 +111,8 @@ class RGASpatial(nn.Module):
         rs = torch.bmm(theta, phi)
         relation = torch.cat([rs, rs.transpose(1, 2)], dim=2).transpose(1, 2)
         relation = self.relation(relation)
-        channel_context = self.g(x).view(b, -1, self.num_nodes).mean(dim=1, keepdim=True)
-        attn = self.attn(torch.cat([relation, channel_context], dim=1))
+        spatial_context = self.g(x).view(b, -1, self.num_nodes).mean(dim=1, keepdim=True)
+        attn = self.attn(torch.cat([relation, spatial_context], dim=1))
         attn = self.sigmoid(attn).view(b, 1, h, w)
         return x * attn
 
@@ -169,8 +169,8 @@ class RGAChannel(nn.Module):
         rc = torch.bmm(theta, phi)
         relation = torch.cat([rc, rc.transpose(1, 2)], dim=2).transpose(1, 2)
         relation = self.relation(relation)
-        spatial_context = self.channel_embed(x).mean(dim=(2, 3)).unsqueeze(1)
-        attn = self.attn(torch.cat([relation, spatial_context], dim=1))
+        channel_context = self.channel_embed(x).mean(dim=(2, 3)).unsqueeze(1)
+        attn = self.attn(torch.cat([relation, channel_context], dim=1))
         attn = self.sigmoid(attn).view(b, c, 1, 1)
         return x * attn
 
