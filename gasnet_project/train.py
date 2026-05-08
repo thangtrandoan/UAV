@@ -73,7 +73,7 @@ class RGASpatial(nn.Module):
         self.num_nodes = spatial_size[0] * spatial_size[1]
         self.spatial_reduction = spatial_reduction
         inter_channels = max(1, channels // channel_reduction)
-        relation_channels = max(1, self.num_nodes // spatial_reduction)
+        relation_features = max(1, self.num_nodes // spatial_reduction)
         self.theta = nn.Sequential(
             nn.Conv2d(channels, inter_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(inter_channels),
@@ -90,15 +90,15 @@ class RGASpatial(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.relation = nn.Sequential(
-            nn.Conv1d(self.num_nodes * 2, relation_channels, kernel_size=1, bias=False),
-            nn.BatchNorm1d(relation_channels),
+            nn.Conv1d(self.num_nodes * 2, relation_features, kernel_size=1, bias=False),
+            nn.BatchNorm1d(relation_features),
             nn.ReLU(inplace=True),
         )
         self.attn = nn.Sequential(
-            nn.Conv1d(relation_channels + 1, relation_channels, kernel_size=1, bias=False),
-            nn.BatchNorm1d(relation_channels),
+            nn.Conv1d(relation_features + 1, relation_features, kernel_size=1, bias=False),
+            nn.BatchNorm1d(relation_features),
             nn.ReLU(inplace=True),
-            nn.Conv1d(relation_channels, 1, kernel_size=1, bias=False),
+            nn.Conv1d(relation_features, 1, kernel_size=1, bias=False),
         )
         self.sigmoid = nn.Sigmoid()
 
@@ -111,8 +111,8 @@ class RGASpatial(nn.Module):
         rs = torch.bmm(theta, phi)
         relation = torch.cat([rs, rs.transpose(1, 2)], dim=2).transpose(1, 2)
         relation = self.relation(relation)
-        g = self.g(x).view(b, -1, self.num_nodes).mean(dim=1, keepdim=True)
-        attn = self.attn(torch.cat([relation, g], dim=1))
+        channel_context = self.g(x).view(b, -1, self.num_nodes).mean(dim=1, keepdim=True)
+        attn = self.attn(torch.cat([relation, channel_context], dim=1))
         attn = self.sigmoid(attn).view(b, 1, h, w)
         return x * attn
 
@@ -129,7 +129,7 @@ class RGAChannel(nn.Module):
         self.spatial_size = spatial_size
         self.num_nodes = spatial_size[0] * spatial_size[1]
         inter_spatial = max(1, self.num_nodes // spatial_reduction)
-        relation_channels = max(1, channels // channel_reduction)
+        relation_features = max(1, channels // channel_reduction)
         self.theta = nn.Sequential(
             nn.Conv1d(self.num_nodes, inter_spatial, kernel_size=1, bias=False),
             nn.BatchNorm1d(inter_spatial),
@@ -141,8 +141,8 @@ class RGAChannel(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.relation = nn.Sequential(
-            nn.Conv1d(channels * 2, relation_channels, kernel_size=1, bias=False),
-            nn.BatchNorm1d(relation_channels),
+            nn.Conv1d(channels * 2, relation_features, kernel_size=1, bias=False),
+            nn.BatchNorm1d(relation_features),
             nn.ReLU(inplace=True),
         )
         self.channel_embed = nn.Sequential(
@@ -151,10 +151,10 @@ class RGAChannel(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.attn = nn.Sequential(
-            nn.Conv1d(relation_channels + 1, relation_channels, kernel_size=1, bias=False),
-            nn.BatchNorm1d(relation_channels),
+            nn.Conv1d(relation_features + 1, relation_features, kernel_size=1, bias=False),
+            nn.BatchNorm1d(relation_features),
             nn.ReLU(inplace=True),
-            nn.Conv1d(relation_channels, 1, kernel_size=1, bias=False),
+            nn.Conv1d(relation_features, 1, kernel_size=1, bias=False),
         )
         self.sigmoid = nn.Sigmoid()
 
@@ -169,8 +169,8 @@ class RGAChannel(nn.Module):
         rc = torch.bmm(theta, phi)
         relation = torch.cat([rc, rc.transpose(1, 2)], dim=2).transpose(1, 2)
         relation = self.relation(relation)
-        orig = self.channel_embed(x).mean(dim=(2, 3)).unsqueeze(1)
-        attn = self.attn(torch.cat([relation, orig], dim=1))
+        spatial_context = self.channel_embed(x).mean(dim=(2, 3)).unsqueeze(1)
+        attn = self.attn(torch.cat([relation, spatial_context], dim=1))
         attn = self.sigmoid(attn).view(b, c, 1, 1)
         return x * attn
 
