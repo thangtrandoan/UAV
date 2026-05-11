@@ -23,6 +23,10 @@ BEST_METRIC_SPLIT_PRIORITY = {
 }
 
 
+def _concat_relation(relation: torch.Tensor) -> torch.Tensor:
+    return torch.cat([relation, relation.transpose(1, 2)], dim=1)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train GASNet on VRU")
     parser.add_argument("--data-root", type=Path, required=True, help="Path containing VRU folder")
@@ -60,32 +64,153 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-class RGABlock(nn.Module):
-    def __init__(self, channels: int, reduction: int = 16, spatial_size: int = 7):
+class RGASpatial(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        spatial_size: tuple[int, int],
+        spatial_reduction: int = 8,
+        channel_reduction: int = 8,
+    ):
         super().__init__()
-        mid = max(1, channels // reduction)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.c_mlp = nn.Sequential(
-            nn.Conv2d(channels, mid, kernel_size=1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid, channels, kernel_size=1, bias=False),
-        )
-        self.s_mlp = nn.Sequential(
-            nn.Conv2d(1, mid, kernel_size=1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid, 1, kernel_size=1, bias=False),
-        )
         self.spatial_size = spatial_size
+        self.num_nodes = spatial_size[0] * spatial_size[1]
+        self.spatial_reduction = spatial_reduction
+        inter_channels = max(1, channels // channel_reduction)
+        relation_features = max(1, self.num_nodes // spatial_reduction)
+        self.theta = nn.Sequential(
+            nn.Conv2d(channels, inter_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.phi = nn.Sequential(
+            nn.Conv2d(channels, inter_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.g = nn.Sequential(
+            nn.Conv2d(channels, inter_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.relation = nn.Sequential(
+            nn.Conv1d(self.num_nodes * 2, relation_features, kernel_size=1, bias=False),
+            nn.BatchNorm1d(relation_features),
+            nn.ReLU(inplace=True),
+        )
+        self.attn = nn.Sequential(
+            nn.Conv1d(relation_features + 1, relation_features, kernel_size=1, bias=False),
+            nn.BatchNorm1d(relation_features),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(relation_features, 1, kernel_size=1, bias=False),
+        )
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        c = self.sigmoid(self.c_mlp(self.pool(x)))
-        s = x.mean(dim=1, keepdim=True)
-        s = F.adaptive_avg_pool2d(s, self.spatial_size)
-        s = self.s_mlp(s)
-        s = F.interpolate(s, size=x.shape[-2:], mode="bilinear", align_corners=False)
-        s = self.sigmoid(s)
-        return x * c * s
+        b, _, h, w = x.shape
+        if h * w != self.num_nodes:
+            raise ValueError(
+                f"Expected spatial dimensions {self.spatial_size} (total={self.num_nodes} nodes), "
+                f"but got {(h, w)} (total={h * w} nodes)"
+            )
+        theta = self.theta(x).view(b, -1, self.num_nodes).transpose(1, 2)
+        phi = self.phi(x).view(b, -1, self.num_nodes)
+        spatial_relation = torch.bmm(theta, phi)
+        relation = _concat_relation(spatial_relation)
+        relation = self.relation(relation)
+        channel_pooled = self.g(x).flatten(2).mean(dim=1, keepdim=True)
+        attn = self.attn(torch.cat([relation, channel_pooled], dim=1))
+        attn = self.sigmoid(attn).view(b, 1, h, w)
+        return x * attn
+
+
+class RGAChannel(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        spatial_size: tuple[int, int],
+        spatial_reduction: int = 8,
+        channel_reduction: int = 8,
+    ):
+        super().__init__()
+        self.spatial_size = spatial_size
+        self.num_nodes = spatial_size[0] * spatial_size[1]
+        inter_spatial = max(1, self.num_nodes // spatial_reduction)
+        relation_features = max(1, channels // channel_reduction)
+        self.theta = nn.Sequential(
+            nn.Conv1d(self.num_nodes, inter_spatial, kernel_size=1, bias=False),
+            nn.BatchNorm1d(inter_spatial),
+            nn.ReLU(inplace=True),
+        )
+        self.phi = nn.Sequential(
+            nn.Conv1d(self.num_nodes, inter_spatial, kernel_size=1, bias=False),
+            nn.BatchNorm1d(inter_spatial),
+            nn.ReLU(inplace=True),
+        )
+        self.relation = nn.Sequential(
+            nn.Conv1d(channels * 2, relation_features, kernel_size=1, bias=False),
+            nn.BatchNorm1d(relation_features),
+            nn.ReLU(inplace=True),
+        )
+        self.channel_embed = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+        self.attn = nn.Sequential(
+            nn.Conv1d(relation_features + 1, relation_features, kernel_size=1, bias=False),
+            nn.BatchNorm1d(relation_features),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(relation_features, 1, kernel_size=1, bias=False),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        if h * w != self.num_nodes:
+            raise ValueError(
+                f"Expected spatial dimensions {self.spatial_size} (total={self.num_nodes} nodes), "
+                f"but got {(h, w)} (total={h * w} nodes)"
+            )
+        x_flat = x.view(b, c, self.num_nodes)
+        x_perm = x_flat.permute(0, 2, 1)
+        theta = self.theta(x_perm).permute(0, 2, 1)
+        phi = self.phi(x_perm)
+        channel_relation = torch.bmm(theta, phi)
+        relation = _concat_relation(channel_relation)
+        relation = self.relation(relation)
+        spatial_pooled = self.channel_embed(x).mean(dim=(2, 3)).unsqueeze(1)
+        attn = self.attn(torch.cat([relation, spatial_pooled], dim=1))
+        attn = self.sigmoid(attn).view(b, c, 1, 1)
+        return x * attn
+
+
+class RGABlock(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        spatial_size: tuple[int, int],
+        spatial_reduction: int = 8,
+        channel_reduction: int = 8,
+    ):
+        super().__init__()
+        self.rga_s = RGASpatial(
+            channels=channels,
+            spatial_size=spatial_size,
+            spatial_reduction=spatial_reduction,
+            channel_reduction=channel_reduction,
+        )
+        self.rga_c = RGAChannel(
+            channels=channels,
+            spatial_size=spatial_size,
+            spatial_reduction=spatial_reduction,
+            channel_reduction=channel_reduction,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.rga_s(x)
+        x = self.rga_c(x)
+        return x
 
 
 class AggregationGate(nn.Module):
@@ -126,10 +251,10 @@ class GASNet(nn.Module):
         self.layer3 = base.layer3
         self.layer4 = base.layer4
         
-        self.ga1 = RGABlock(256)
-        self.ga2 = RGABlock(512)
-        self.ga3 = RGABlock(1024)
-        self.ga4 = RGABlock(2048)
+        self.ga1 = RGABlock(256, spatial_size=(56, 56))
+        self.ga2 = RGABlock(512, spatial_size=(28, 28))
+        self.ga3 = RGABlock(1024, spatial_size=(14, 14))
+        self.ga4 = RGABlock(2048, spatial_size=(7, 7))
         
         self.fs1 = AggregationGate(1024, 512)
         self.fs2 = AggregationGate(512, 512)
