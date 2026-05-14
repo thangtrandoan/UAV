@@ -90,7 +90,7 @@ def evaluate_map_cmc(
             first_match_topk = first_match[first_match < max_k]
             if first_match_topk.numel() > 0:
                 counts = torch.bincount(first_match_topk, minlength=max_k).to(cmc.dtype)
-                cmc += torch.flip(torch.cumsum(torch.flip(counts, dims=[0]), dim=0), dims=[0])
+                cmc += torch.cumsum(counts, dim=0)
 
             valid_matches = matches[has_match].to(torch.float32)
             precision = torch.cumsum(valid_matches, dim=1) / positions
