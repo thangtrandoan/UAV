@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import random
 import time
 from pathlib import Path
 from typing import List
@@ -416,6 +417,61 @@ def make_loader(
     )
 
 
+class PKBatchSampler(torch.utils.data.Sampler[List[int]]):
+    def __init__(self, labels: List[int], p: int, k: int):
+        self.p = p
+        self.k = k
+        label_to_indices: dict[int, List[int]] = {}
+        for idx, label in enumerate(labels):
+            label_to_indices.setdefault(label, []).append(idx)
+
+        self.label_to_indices = label_to_indices
+        self.labels = [label for label, idxs in label_to_indices.items() if len(idxs) >= k]
+        if len(self.labels) < p:
+            raise ValueError(f"Need at least {p} identities with >= {k} samples, got {len(self.labels)}")
+
+    def __len__(self) -> int:
+        return len(self.labels) // self.p
+
+    def __iter__(self):
+        labels = self.labels.copy()
+        random.shuffle(labels)
+        for i in range(0, len(labels) - self.p + 1, self.p):
+            batch_labels = labels[i : i + self.p]
+            batch: List[int] = []
+            for label in batch_labels:
+                indices = self.label_to_indices[label]
+                batch.extend(random.sample(indices, self.k))
+            yield batch
+
+
+def make_pk_loader(
+    samples: List,
+    transform,
+    label_map: dict,
+    p: int,
+    k: int,
+    num_workers: int = 4,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
+    prefetch_factor: int = 2,
+):
+    labels = [label_map[s.vehicle_id] for s in samples]
+    batch_sampler = PKBatchSampler(labels, p=p, k=k)
+    ds = VRUDataset(samples=samples, transform=transform, relabel=True, label_map=label_map, max_retries=3)
+    loader_kwargs = dict(pin_memory=pin_memory)
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = persistent_workers
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+
+    return DataLoader(
+        ds,
+        batch_sampler=batch_sampler,
+        num_workers=num_workers,
+        **loader_kwargs,
+    )
+
+
 def _best_checkpoint_path(save_path: Path) -> Path:
     return save_path.with_name(f"{save_path.stem}.best{save_path.suffix}")
 
@@ -500,16 +556,19 @@ def main() -> None:
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
+    pk_k = 4
     batch_size = args.batch_size
+    if batch_size % pk_k != 0:
+        raise ValueError(f"--batch-size must be divisible by k={pk_k}, got {batch_size}")
+    pk_p = batch_size // pk_k
     learning_rate = args.base_lr * (batch_size / args.base_batch_size)
 
-    train_loader = make_loader(
+    train_loader = make_pk_loader(
         train_samples,
         train_tfms,
-        batch_size,
-        True,
-        relabel=True,
         label_map=train_label_map,
+        p=pk_p,
+        k=pk_k,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
@@ -524,7 +583,17 @@ def main() -> None:
         print("Compiling model with torch.compile...")
         model = torch.compile(model, mode="reduce-overhead")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=5e-4)
+    warmup_epochs = 5
+    milestones = [40, 50]
+
+    def lr_lambda(epoch: int) -> float:
+        if epoch < warmup_epochs:
+            return float(epoch + 1) / warmup_epochs
+        drops = sum(epoch + 1 >= m for m in milestones)
+        return 0.1 ** drops
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # New API first, old API fallback for compatibility.
     try:
@@ -563,7 +632,7 @@ def main() -> None:
                 (g_feat, f_feat), (logits_g, logits_f) = model(imgs)
                 loss_id = ce_loss(logits_g, labels) + ce_loss(logits_f, labels)
                 loss_tri = batch_hard_triplet_loss(g_feat, labels) + batch_hard_triplet_loss(f_feat, labels)
-                loss = loss_id + loss_tri
+                loss = loss_id + 0.5 * loss_tri
 
             loss_to_backprop = loss / args.grad_accum
             if use_amp and use_scaler:
@@ -594,6 +663,7 @@ def main() -> None:
 
         epoch_loss = running / len(train_loader.dataset)
         print(f"Epoch {epoch}: loss={epoch_loss:.4f}, time={(time.time() - t0)/60:.1f} min")
+        scheduler.step()
 
         should_eval_this_epoch = args.run_eval and args.eval_every > 0 and (epoch % args.eval_every == 0)
         if should_eval_this_epoch:
