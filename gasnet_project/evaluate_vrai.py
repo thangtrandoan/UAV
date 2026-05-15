@@ -46,9 +46,12 @@ class VRAIDataset(Dataset):
 def _normalize_state_dict(state_dict: dict) -> dict:
     if not state_dict:
         return state_dict
-    if all(k.startswith("module.") for k in state_dict.keys()):
-        return {k[len("module.") :]: v for k, v in state_dict.items()}
-    return state_dict
+    out = state_dict
+    if all(k.startswith("module.") for k in out.keys()):
+        out = {k[len("module.") :]: v for k, v in out.items()}
+    if all(k.startswith("_orig_mod.") for k in out.keys()):
+        out = {k[len("_orig_mod.") :]: v for k, v in out.items()}
+    return out
 
 
 def _infer_num_classes(state_dict: dict) -> int:
@@ -252,6 +255,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--q-chunk-size", type=int, default=512)
     parser.add_argument("--topk", type=int, default=1000)
     parser.add_argument("--output", type=Path, default=Path("submission_vrai.json"))
+    parser.add_argument("--num-classes", type=int, default=None)
     parser.add_argument("--device", type=str, default="")
     return parser.parse_args()
 
@@ -347,11 +351,18 @@ def main() -> None:
     )
 
     state_dict = _normalize_state_dict(_load_checkpoint(args.model_path))
-    num_classes = _infer_num_classes(state_dict)
+    try:
+        num_classes = _infer_num_classes(state_dict)
+    except KeyError:
+        if args.num_classes is None:
+            raise
+        num_classes = args.num_classes
     model = GASNet(num_classes=num_classes, use_pretrained=False).to(device)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
-    model.load_state_dict(state_dict, strict=True)
+    model_state = model.state_dict()
+    filtered_state = {k: v for k, v in state_dict.items() if k in model_state and v.shape == model_state[k].shape}
+    model.load_state_dict(filtered_state, strict=False)
     model.eval()
 
     q_feat = _extract_features(model, q_loader, device, use_amp, amp_dtype, use_channels_last).to(device)
