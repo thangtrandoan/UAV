@@ -145,9 +145,11 @@ def _extract_features(
     use_amp: bool,
     amp_dtype: torch.dtype,
     use_channels_last: bool,
+    log_every: int,
 ) -> torch.Tensor:
     feats = []
-    for imgs in loader:
+    total = len(loader)
+    for step, imgs in enumerate(loader, 1):
         if use_channels_last:
             imgs = imgs.to(device, non_blocking=True, memory_format=torch.channels_last)
         else:
@@ -162,6 +164,8 @@ def _extract_features(
             emb = torch.cat([bn_global, bn_fs], dim=1)
 
         feats.append(emb.float())
+        if log_every > 0 and (step == 1 or step % log_every == 0 or step == total):
+            print(f"  [feat] batch {step}/{total}")
 
     return torch.cat(feats, dim=0)
 
@@ -256,6 +260,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topk", type=int, default=1000)
     parser.add_argument("--output", type=Path, default=Path("submission_vrai.json"))
     parser.add_argument("--num-classes", type=int, default=None)
+    parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--device", type=str, default="")
     return parser.parse_args()
 
@@ -365,8 +370,24 @@ def main() -> None:
     model.load_state_dict(filtered_state, strict=False)
     model.eval()
 
-    q_feat = _extract_features(model, q_loader, device, use_amp, amp_dtype, use_channels_last).to(device)
-    g_feat = _extract_features(model, g_loader, device, use_amp, amp_dtype, use_channels_last).to(device)
+    q_feat = _extract_features(
+        model,
+        q_loader,
+        device,
+        use_amp,
+        amp_dtype,
+        use_channels_last,
+        args.log_every,
+    ).to(device)
+    g_feat = _extract_features(
+        model,
+        g_loader,
+        device,
+        use_amp,
+        amp_dtype,
+        use_channels_last,
+        args.log_every,
+    ).to(device)
 
     if args.mode == "eval":
         q_ids = torch.tensor(query_ids, dtype=torch.long, device=device)
@@ -379,7 +400,7 @@ def main() -> None:
             topk=(1, 5),
             q_chunk_size=args.q_chunk_size,
             use_fp16_sim=(not args.no_fp16_sim),
-            verbose=False,
+            verbose=True,
         )
 
         print("\n=== VRAI Evaluation ===")
