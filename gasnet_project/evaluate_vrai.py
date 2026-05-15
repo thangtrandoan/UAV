@@ -187,6 +187,10 @@ def _infer_eval_lists(
         raise KeyError("Annotation file missing test_im_names or dev_im_names")
     query_idx = annotation["query_order"]
     gallery_idx = annotation["gallery_order"]
+    if query_idx and isinstance(query_idx[0], str):
+        index_map = {name: i for i, name in enumerate(image_names)}
+        query_idx = [index_map[name] for name in query_idx]
+        gallery_idx = [index_map[name] for name in gallery_idx]
 
     if id_map_path is None:
         raise ValueError(
@@ -298,6 +302,10 @@ def main() -> None:
             raise KeyError("Annotation file missing test_im_names or dev_im_names")
         query_idx = annotation["query_order"]
         gallery_idx = annotation["gallery_order"]
+        if query_idx and isinstance(query_idx[0], str):
+            index_map = {name: i for i, name in enumerate(image_names)}
+            query_idx = [index_map[name] for name in query_idx]
+            gallery_idx = [index_map[name] for name in gallery_idx]
     image_paths = [images_dir / name for name in image_names]
 
     if not image_paths:
