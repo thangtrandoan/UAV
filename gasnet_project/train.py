@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import random
 import time
 from pathlib import Path
 from typing import List
@@ -213,29 +214,99 @@ class RGABlock(nn.Module):
         return x
 
 
-class AggregationGate(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
+class Lite3x3(nn.Module):
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.branches = nn.ModuleList([
-            nn.Sequential(nn.Conv2d(in_ch, out_ch, 1, bias=False), nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)),
-            nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False), nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)),
-            nn.Sequential(nn.Conv2d(in_ch, out_ch, 5, padding=2, bias=False), nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)),
-            nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=2, dilation=2, bias=False), nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)),
-        ])
-        self.gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(out_ch * 4, out_ch, 1, bias=False),
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, 4, 1, bias=True),
-            nn.Softmax(dim=1),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, groups=out_ch, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
         )
 
+    def forward(self, x):
+        return self.block(x)
+
+
+class ChannelGate(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        mid = max(1, channels // reduction)
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, mid, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, channels, 1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return self.gate(x)
+
+
+class OSBlockFS(nn.Module):
+    def __init__(self, in_ch, out_ch, reduction=16):
+        super().__init__()
+        mid_ch = out_ch
+
+        self.stream1 = nn.Sequential(
+            Lite3x3(in_ch, mid_ch)
+        )
+        self.stream2 = nn.Sequential(
+            Lite3x3(in_ch, mid_ch),
+            Lite3x3(mid_ch, mid_ch)
+        )
+        self.stream3 = nn.Sequential(
+            Lite3x3(in_ch, mid_ch),
+            Lite3x3(mid_ch, mid_ch),
+            Lite3x3(mid_ch, mid_ch)
+        )
+        self.stream4 = nn.Sequential(
+            Lite3x3(in_ch, mid_ch),
+            Lite3x3(mid_ch, mid_ch),
+            Lite3x3(mid_ch, mid_ch),
+            Lite3x3(mid_ch, mid_ch)
+        )
+
+        # shared AG
+        self.gate = ChannelGate(mid_ch, reduction)
+
+        self.shortcut = nn.Sequential()
+        if in_ch != out_ch:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1, bias=False),
+                nn.BatchNorm2d(out_ch)
+            )
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        s1 = self.stream1(x)
+        s2 = self.stream2(x)
+        s3 = self.stream3(x)
+        s4 = self.stream4(x)
+
+        out = (
+            self.gate(s1) * s1 +
+            self.gate(s2) * s2 +
+            self.gate(s3) * s3 +
+            self.gate(s4) * s4
+        )
+
+        out = out + self.shortcut(x)
+        return self.relu(out)
+
+
+class BNNeck(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.bn = nn.BatchNorm1d(dim)
+        self.bn.bias.requires_grad_(False)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats = [b(x) for b in self.branches]
-        stacked = torch.cat(feats, dim=1)
-        weights = self.gate(stacked)
-        out = sum(feats[i] * weights[:, i : i + 1] for i in range(4))
-        return out
+        return self.bn(x)
 
 
 class GASNet(nn.Module):
@@ -256,12 +327,13 @@ class GASNet(nn.Module):
         self.ga3 = RGABlock(1024, spatial_size=(14, 14))
         self.ga4 = RGABlock(2048, spatial_size=(7, 7))
         
-        self.fs1 = AggregationGate(1024, 512)
-        self.fs2 = AggregationGate(512, 512)
+        self.fs1 = OSBlockFS(1024, 512)
+        self.fs2 = OSBlockFS(512, 512)
         
         self.gap = nn.AdaptiveAvgPool2d(1)
-        self.bnneck_global = nn.BatchNorm1d(2048)
-        self.bnneck_fs = nn.BatchNorm1d(512)
+        self.bnneck_global = BNNeck(2048)
+        self.bnneck_fs = BNNeck(512)
+        
         self.classifier_global = nn.Linear(2048, num_classes, bias=False)
         self.classifier_fs = nn.Linear(512, num_classes, bias=False)
 
@@ -286,9 +358,12 @@ class GASNet(nn.Module):
         bn_global = self.bnneck_global(global_feat)
         bn_fs = self.bnneck_fs(fs_feat)
 
+        logits_global = self.classifier_global(bn_global)
+        logits_fs = self.classifier_fs(bn_fs)
+
         if self.training:
-            return (global_feat, fs_feat), (self.classifier_global(bn_global), self.classifier_fs(bn_fs))
-        return (global_feat, fs_feat), (bn_global, bn_fs)
+            return (global_feat, fs_feat), (logits_global, logits_fs)
+        return bn_global, bn_fs
 
 
 def batch_hard_triplet_loss(feat: torch.Tensor, labels: torch.Tensor, margin: float = 0.3) -> torch.Tensor:
@@ -308,7 +383,7 @@ def batch_hard_triplet_loss(feat: torch.Tensor, labels: torch.Tensor, margin: fl
 
     valid = hardest_pos > -0.5
     if valid.sum() == 0:
-        return torch.tensor(0.0, device=feat.device)
+        return feat.sum() * 0.0
     return F.relu(hardest_pos[valid] - hardest_neg[valid] + margin).mean()
 
 
@@ -337,6 +412,61 @@ def make_loader(
         ds,
         batch_size=batch_size,
         shuffle=is_train,
+        num_workers=num_workers,
+        **loader_kwargs,
+    )
+
+
+class PKBatchSampler(torch.utils.data.Sampler[List[int]]):
+    def __init__(self, labels: List[int], p: int, k: int):
+        self.p = p
+        self.k = k
+        label_to_indices: dict[int, List[int]] = {}
+        for idx, label in enumerate(labels):
+            label_to_indices.setdefault(label, []).append(idx)
+
+        self.label_to_indices = label_to_indices
+        self.labels = [label for label, idxs in label_to_indices.items() if len(idxs) >= k]
+        if len(self.labels) < p:
+            raise ValueError(f"Need at least {p} identities with >= {k} samples, got {len(self.labels)}")
+
+    def __len__(self) -> int:
+        return len(self.labels) // self.p
+
+    def __iter__(self):
+        labels = self.labels.copy()
+        random.shuffle(labels)
+        for i in range(0, len(labels) - self.p + 1, self.p):
+            batch_labels = labels[i : i + self.p]
+            batch: List[int] = []
+            for label in batch_labels:
+                indices = self.label_to_indices[label]
+                batch.extend(random.sample(indices, self.k))
+            yield batch
+
+
+def make_pk_loader(
+    samples: List,
+    transform,
+    label_map: dict,
+    p: int,
+    k: int,
+    num_workers: int = 4,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
+    prefetch_factor: int = 2,
+):
+    labels = [label_map[s.vehicle_id] for s in samples]
+    batch_sampler = PKBatchSampler(labels, p=p, k=k)
+    ds = VRUDataset(samples=samples, transform=transform, relabel=True, label_map=label_map, max_retries=3)
+    loader_kwargs = dict(pin_memory=pin_memory)
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = persistent_workers
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+
+    return DataLoader(
+        ds,
+        batch_sampler=batch_sampler,
         num_workers=num_workers,
         **loader_kwargs,
     )
@@ -426,16 +556,19 @@ def main() -> None:
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
+    pk_k = 4
     batch_size = args.batch_size
+    if batch_size % pk_k != 0:
+        raise ValueError(f"--batch-size must be divisible by k={pk_k}, got {batch_size}")
+    pk_p = batch_size // pk_k
     learning_rate = args.base_lr * (batch_size / args.base_batch_size)
 
-    train_loader = make_loader(
+    train_loader = make_pk_loader(
         train_samples,
         train_tfms,
-        batch_size,
-        True,
-        relabel=True,
         label_map=train_label_map,
+        p=pk_p,
+        k=pk_k,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
@@ -450,7 +583,17 @@ def main() -> None:
         print("Compiling model with torch.compile...")
         model = torch.compile(model, mode="reduce-overhead")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=5e-4)
+    warmup_epochs = 5
+    milestones = [40, 50]
+
+    def lr_lambda(epoch: int) -> float:
+        if epoch < warmup_epochs:
+            return float(epoch + 1) / warmup_epochs
+        drops = sum(epoch + 1 >= m for m in milestones)
+        return 0.1 ** drops
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # New API first, old API fallback for compatibility.
     try:
@@ -465,7 +608,7 @@ def main() -> None:
     )
 
     model.train()
-    ce_loss = nn.CrossEntropyLoss()
+    ce_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
     best_score = None
     best_epoch = None
     best_split = None
@@ -489,7 +632,7 @@ def main() -> None:
                 (g_feat, f_feat), (logits_g, logits_f) = model(imgs)
                 loss_id = ce_loss(logits_g, labels) + ce_loss(logits_f, labels)
                 loss_tri = batch_hard_triplet_loss(g_feat, labels) + batch_hard_triplet_loss(f_feat, labels)
-                loss = loss_id + loss_tri
+                loss = loss_id + 0.5 * loss_tri
 
             loss_to_backprop = loss / args.grad_accum
             if use_amp and use_scaler:
@@ -520,6 +663,7 @@ def main() -> None:
 
         epoch_loss = running / len(train_loader.dataset)
         print(f"Epoch {epoch}: loss={epoch_loss:.4f}, time={(time.time() - t0)/60:.1f} min")
+        scheduler.step()
 
         should_eval_this_epoch = args.run_eval and args.eval_every > 0 and (epoch % args.eval_every == 0)
         if should_eval_this_epoch:

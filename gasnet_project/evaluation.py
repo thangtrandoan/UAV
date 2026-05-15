@@ -71,7 +71,7 @@ def _extract_features(
             autocast_kwargs["dtype"] = amp_dtype
 
         with torch.autocast(**autocast_kwargs):
-            _, (bn_global, bn_fs) = model(imgs)
+            bn_global, bn_fs = model(imgs)
             emb = torch.cat([bn_global, bn_fs], dim=1)
 
         feats.append(emb.float().to(out_device, non_blocking=(out_device.type == "cuda")))
