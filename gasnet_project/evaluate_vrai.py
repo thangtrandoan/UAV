@@ -555,8 +555,18 @@ def _save_attention_heatmaps(
     out_dir.mkdir(parents=True, exist_ok=True)
     stats = []
     for layer, attn_tensor in captured.items():
+        spatial_size = getattr(getattr(model, layer).rga_s, "spatial_size", None)
         attn = np.squeeze(attn_tensor[0].numpy())
-        if attn.ndim == 3:
+        if attn.ndim == 1 and spatial_size is not None:
+            expected_nodes = int(spatial_size[0] * spatial_size[1])
+            if attn.size == expected_nodes:
+                attn = attn.reshape(spatial_size)
+        elif attn.ndim == 2 and 1 in attn.shape and spatial_size is not None:
+            flat = attn.reshape(-1)
+            expected_nodes = int(spatial_size[0] * spatial_size[1])
+            if flat.size == expected_nodes:
+                attn = flat.reshape(spatial_size)
+        elif attn.ndim == 3:
             attn = attn[0]
         if attn.ndim != 2:
             raise ValueError(f"Unexpected attention shape for {layer}: {tuple(attn_tensor.shape)}")
