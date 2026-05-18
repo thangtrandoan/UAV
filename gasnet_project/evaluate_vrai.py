@@ -2,18 +2,44 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import pickle
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 from train import GASNet
 from utils import choose_amp_dtype, configure_cuda_for_speed, evaluate_map_cmc
+
+
+COLOR_NAMES = {
+    0: "White",
+    1: "Black",
+    2: "Gray",
+    3: "Red",
+    4: "Green",
+    5: "Blue",
+    6: "Yellow",
+    7: "Brown",
+    8: "Others",
+}
+TYPE_NAMES = {
+    0: "Sedan",
+    1: "Hatchback",
+    2: "SUV",
+    3: "Bus",
+    4: "Lorry",
+    5: "Truck",
+    6: "Others",
+}
+ATTRIBUTE_KEYS = ("color_label", "type_label", "bumper_label", "wheel_label", "sky_label", "luggage_label")
 
 
 class VRAIDataset(Dataset):
@@ -90,6 +116,75 @@ def _parse_train_id(image_name: str) -> str:
     if "_" not in stem:
         raise ValueError(f"Unexpected train image name format: {image_name}")
     return stem.split("_", 1)[0]
+
+
+def _parse_train_camera(image_name: str) -> str:
+    parts = Path(image_name).stem.split("_")
+    if len(parts) < 2:
+        return ""
+    return parts[1]
+
+
+def _parse_train_frame(image_name: str) -> str:
+    parts = Path(image_name).stem.split("_")
+    if len(parts) < 3:
+        return ""
+    return parts[2]
+
+
+def _identity_key(image_name: str, split: str) -> int | str:
+    if split == "train":
+        return int(_parse_train_id(image_name))
+    return image_name
+
+
+def _label_name(key: str, value) -> str | int | None:
+    if value is None:
+        return None
+    value = int(value)
+    if key == "color_label":
+        return COLOR_NAMES.get(value, value)
+    if key == "type_label":
+        return TYPE_NAMES.get(value, value)
+    return value
+
+
+def _get_attrs(annotation: dict, image_name: str, split: str) -> dict:
+    identity_key = _identity_key(image_name, split)
+    attrs = {}
+    for key in ATTRIBUTE_KEYS:
+        labels = annotation.get(key, {})
+        value = None
+        if isinstance(labels, dict):
+            if identity_key in labels:
+                value = labels[identity_key]
+            elif str(identity_key) in labels:
+                value = labels[str(identity_key)]
+            elif image_name in labels:
+                value = labels[image_name]
+        attrs[key] = _label_name(key, value)
+    return attrs
+
+
+def _attr_mismatches(a: dict, b: dict) -> List[str]:
+    mismatches = []
+    for key in ATTRIBUTE_KEYS:
+        if a.get(key) is not None and b.get(key) is not None and a[key] != b[key]:
+            mismatches.append(key)
+    return mismatches
+
+
+def _human_obvious_hint(mismatches: List[str], same_camera: bool, q_parts: int, pred_parts: int) -> str:
+    semantic = {"color_label", "type_label"}
+    if semantic.intersection(mismatches):
+        return "likely_obvious_color_or_type_mismatch"
+    if len(mismatches) >= 3:
+        return "likely_obvious_many_attribute_mismatches"
+    if not mismatches and same_camera:
+        return "likely_hard_same_camera_similar_attributes"
+    if q_parts > 0 and pred_parts > 0:
+        return "needs_visual_check_discriminative_parts_available"
+    return "ambiguous_needs_visual_check"
 
 
 def _build_train_query_gallery(image_names: List[str]) -> Tuple[List[int], List[int], List[int], List[int]]:
@@ -241,6 +336,318 @@ def _build_reid_result(
     return results
 
 
+@torch.no_grad()
+def _collect_failure_cases(
+    q_feat: torch.Tensor,
+    g_feat: torch.Tensor,
+    query_ids: List[int],
+    gallery_ids: List[int],
+    query_idx: List[int],
+    gallery_idx: List[int],
+    image_names: List[str],
+    annotation: dict,
+    split: str,
+    topk: int,
+    q_chunk_size: int,
+    use_fp16_sim: bool,
+) -> Tuple[List[dict], dict]:
+    q = F.normalize(q_feat.float(), dim=1)
+    g = F.normalize(g_feat.float(), dim=1)
+    q_ids = torch.tensor(query_ids, dtype=torch.long, device=q.device)
+    g_ids = torch.tensor(gallery_ids, dtype=torch.long, device=q.device)
+    k = min(topk, g.size(0))
+
+    sim_dtype = None
+    if q.is_cuda and use_fp16_sim:
+        sim_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    q_mm = q.to(sim_dtype) if sim_dtype is not None else q
+    g_mm = g.to(sim_dtype) if sim_dtype is not None else g
+
+    failures: List[dict] = []
+    summary = {
+        "num_queries": len(query_ids),
+        "num_gallery": len(gallery_ids),
+        "num_rank1_failures": 0,
+        "first_correct_rank_histogram": Counter(),
+        "predicted_wrong_identity_histogram": Counter(),
+        "attribute_mismatch_histogram": Counter(),
+        "human_obvious_hint_histogram": Counter(),
+        "same_camera_rank1_failures": 0,
+    }
+
+    for start in range(0, q_mm.size(0), q_chunk_size):
+        end = min(start + q_chunk_size, q_mm.size(0))
+        sim = q_mm[start:end] @ g_mm.t()
+        if sim_dtype is not None:
+            sim = sim.float()
+        scores, order = torch.topk(sim, k=k, dim=1, largest=True, sorted=True)
+        matches = g_ids[order] == q_ids[start:end].unsqueeze(1)
+
+        for local_row in range(order.size(0)):
+            q_local = start + local_row
+            q_name = image_names[query_idx[q_local]]
+            q_id = int(query_ids[q_local])
+            match_positions = torch.where(matches[local_row])[0]
+            first_correct_rank = int(match_positions[0].item() + 1) if match_positions.numel() else None
+            if first_correct_rank is None:
+                summary["first_correct_rank_histogram"]["no_match_in_topk"] += 1
+            else:
+                bucket = str(first_correct_rank if first_correct_rank <= 10 else "gt10")
+                summary["first_correct_rank_histogram"][bucket] += 1
+
+            pred_gallery_local = int(order[local_row, 0].item())
+            pred_name = image_names[gallery_idx[pred_gallery_local]]
+            pred_id = int(gallery_ids[pred_gallery_local])
+            if pred_id == q_id:
+                continue
+
+            q_attrs = _get_attrs(annotation, q_name, split)
+            pred_attrs = _get_attrs(annotation, pred_name, split)
+            mismatches = _attr_mismatches(q_attrs, pred_attrs)
+            same_camera = _parse_train_camera(q_name) == _parse_train_camera(pred_name) if split == "train" else False
+            q_parts = len(annotation.get("d_part_label", {}).get(q_name, []))
+            pred_parts = len(annotation.get("d_part_label", {}).get(pred_name, []))
+            human_hint = _human_obvious_hint(mismatches, same_camera, q_parts, pred_parts)
+
+            top_matches = []
+            for rank, (g_local_t, score_t) in enumerate(zip(order[local_row].tolist(), scores[local_row].tolist()), 1):
+                g_name = image_names[gallery_idx[int(g_local_t)]]
+                g_id = int(gallery_ids[int(g_local_t)])
+                top_matches.append(
+                    {
+                        "rank": rank,
+                        "gallery_index": int(gallery_idx[int(g_local_t)]),
+                        "name": g_name,
+                        "id": g_id,
+                        "camera": _parse_train_camera(g_name) if split == "train" else "",
+                        "score": float(score_t),
+                        "is_correct": g_id == q_id,
+                    }
+                )
+
+            case = {
+                "query_local_index": q_local,
+                "query_index": int(query_idx[q_local]),
+                "query_name": q_name,
+                "query_id": q_id,
+                "query_camera": _parse_train_camera(q_name) if split == "train" else "",
+                "query_frame": _parse_train_frame(q_name) if split == "train" else "",
+                "query_attrs": q_attrs,
+                "query_discriminative_parts": q_parts,
+                "rank1_gallery_index": int(gallery_idx[pred_gallery_local]),
+                "rank1_name": pred_name,
+                "rank1_id": pred_id,
+                "rank1_camera": _parse_train_camera(pred_name) if split == "train" else "",
+                "rank1_frame": _parse_train_frame(pred_name) if split == "train" else "",
+                "rank1_attrs": pred_attrs,
+                "rank1_discriminative_parts": pred_parts,
+                "first_correct_rank": first_correct_rank,
+                "attribute_mismatches": mismatches,
+                "same_camera_as_rank1": same_camera,
+                "human_obvious_hint": human_hint,
+                "top_matches": top_matches,
+            }
+            failures.append(case)
+            summary["num_rank1_failures"] += 1
+            summary["predicted_wrong_identity_histogram"][str(pred_id)] += 1
+            summary["human_obvious_hint_histogram"][human_hint] += 1
+            if same_camera:
+                summary["same_camera_rank1_failures"] += 1
+            for key in mismatches:
+                summary["attribute_mismatch_histogram"][key] += 1
+
+    summary = {k: (dict(v) if isinstance(v, Counter) else v) for k, v in summary.items()}
+    failures.sort(key=lambda c: (c["first_correct_rank"] is not None, c["first_correct_rank"] or math.inf))
+    return failures, summary
+
+
+def _prepare_display_image(path: Path, size: int = 224) -> Image.Image:
+    with Image.open(path) as img:
+        img = img.convert("RGB").resize((256, 256), Image.BILINEAR)
+    left = (img.width - size) // 2
+    top = (img.height - size) // 2
+    return img.crop((left, top, left + size, top + size))
+
+
+def _draw_label(draw: ImageDraw.ImageDraw, xy: Tuple[int, int], text: str, fill: Tuple[int, int, int]) -> None:
+    font = ImageFont.load_default()
+    bbox = draw.textbbox(xy, text, font=font)
+    pad = 3
+    draw.rectangle((bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad), fill=(0, 0, 0))
+    draw.text(xy, text, fill=fill, font=font)
+
+
+def _save_contact_sheet(case: dict, images_dir: Path, out_path: Path, topk: int) -> None:
+    tiles = []
+    q_img = _prepare_display_image(images_dir / case["query_name"])
+    q_draw = ImageDraw.Draw(q_img)
+    _draw_label(q_draw, (6, 6), f"Q id={case['query_id']} cam={case['query_camera']}", (255, 255, 255))
+    tiles.append(q_img)
+
+    for match in case["top_matches"][:topk]:
+        img = _prepare_display_image(images_dir / match["name"])
+        draw = ImageDraw.Draw(img)
+        fill = (80, 220, 120) if match["is_correct"] else (255, 90, 90)
+        _draw_label(draw, (6, 6), f"R{match['rank']} id={match['id']} {match['score']:.3f}", fill)
+        _draw_label(draw, (6, 24), f"cam={match['camera']}", fill)
+        tiles.append(img)
+
+    w, h = tiles[0].size
+    sheet = Image.new("RGB", (w * len(tiles), h), (20, 20, 20))
+    for i, tile in enumerate(tiles):
+        sheet.paste(tile, (i * w, 0))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(out_path)
+
+
+def _make_heat_color(attn: np.ndarray) -> np.ndarray:
+    attn = np.clip(attn, 0.0, 1.0)
+    red = (255 * attn).astype(np.uint8)
+    green = (255 * (1.0 - np.abs(attn - 0.5) * 2.0)).astype(np.uint8)
+    blue = (255 * (1.0 - attn)).astype(np.uint8)
+    return np.stack([red, green, blue], axis=-1)
+
+
+@torch.no_grad()
+def _save_attention_heatmaps(
+    model: torch.nn.Module,
+    image_path: Path,
+    out_dir: Path,
+    device: torch.device,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    use_channels_last: bool,
+    layers: List[str],
+) -> List[dict]:
+    base = _prepare_display_image(image_path)
+    tensor = transforms.ToTensor()(base)
+    tensor = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(tensor).unsqueeze(0)
+    if use_channels_last:
+        tensor = tensor.to(device, non_blocking=True, memory_format=torch.channels_last)
+    else:
+        tensor = tensor.to(device, non_blocking=True)
+
+    captured: Dict[str, torch.Tensor] = {}
+    handles = []
+    def _capture_hook(name: str):
+        def hook(_module, _inputs, output):
+            captured[name] = output.detach().float().cpu()
+            return None
+        return hook
+
+    for layer in layers:
+        module = getattr(model, layer).rga_s.sigmoid
+        handles.append(module.register_forward_hook(_capture_hook(layer)))
+
+    autocast_kwargs = dict(device_type=device.type, enabled=(use_amp and device.type == "cuda"))
+    if device.type == "cuda":
+        autocast_kwargs["dtype"] = amp_dtype
+    with torch.autocast(**autocast_kwargs):
+        model(tensor)
+    for handle in handles:
+        handle.remove()
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stats = []
+    for layer, attn_tensor in captured.items():
+        attn = attn_tensor[0, 0].numpy()
+        low, high = np.percentile(attn, [1, 99])
+        attn_norm = (attn - low) / max(high - low, 1e-6)
+        heat = Image.fromarray(_make_heat_color(attn_norm)).resize(base.size, Image.BILINEAR)
+        overlay = Image.blend(base, heat, alpha=0.45)
+
+        y_idx, x_idx = np.indices(attn.shape)
+        weight = np.maximum(attn - attn.min(), 0.0) + 1e-8
+        cx = float((x_idx * weight).sum() / weight.sum() / max(attn.shape[1] - 1, 1))
+        cy = float((y_idx * weight).sum() / weight.sum() / max(attn.shape[0] - 1, 1))
+        stats.append(
+            {
+                "layer": layer,
+                "mean": float(attn.mean()),
+                "max": float(attn.max()),
+                "min": float(attn.min()),
+                "center_of_mass_x": cx,
+                "center_of_mass_y": cy,
+            }
+        )
+        overlay.save(out_dir / f"{image_path.stem}_{layer}_spatial_attention.jpg")
+
+    return stats
+
+
+def _write_failure_analysis(
+    failures: List[dict],
+    summary: dict,
+    image_names: List[str],
+    images_dir: Path,
+    annotation: dict,
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+    device: torch.device,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    use_channels_last: bool,
+) -> None:
+    out_dir = args.analysis_output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    selected = failures[: args.analysis_max_cases]
+    with (out_dir / "failure_cases.jsonl").open("w", encoding="utf-8") as f:
+        for case in selected:
+            f.write(json.dumps(case, ensure_ascii=False) + "\n")
+
+    summary["written_failure_cases"] = len(selected)
+    summary["heatmap_cases"] = min(args.heatmap_cases, len(selected))
+    with (out_dir / "failure_summary.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    for idx, case in enumerate(selected[: args.heatmap_cases]):
+        case_dir = out_dir / f"case_{idx:04d}_q{case['query_index']}_pred{case['rank1_gallery_index']}"
+        _save_contact_sheet(case, images_dir, case_dir / "top_matches.jpg", args.contact_sheet_topk)
+        heatmap_stats = {}
+        q_stats = _save_attention_heatmaps(
+            model,
+            images_dir / case["query_name"],
+            case_dir / "query_heatmaps",
+            device,
+            use_amp,
+            amp_dtype,
+            use_channels_last,
+            args.heatmap_layers,
+        )
+        heatmap_stats["query"] = q_stats
+        rank1_stats = _save_attention_heatmaps(
+            model,
+            images_dir / case["rank1_name"],
+            case_dir / "rank1_heatmaps",
+            device,
+            use_amp,
+            amp_dtype,
+            use_channels_last,
+            args.heatmap_layers,
+        )
+        heatmap_stats["rank1_wrong_match"] = rank1_stats
+
+        if case["first_correct_rank"] is not None:
+            correct = next((m for m in case["top_matches"] if m["is_correct"]), None)
+            if correct is not None:
+                heatmap_stats["first_correct_match"] = _save_attention_heatmaps(
+                    model,
+                    images_dir / correct["name"],
+                    case_dir / "first_correct_heatmaps",
+                    device,
+                    use_amp,
+                    amp_dtype,
+                    use_channels_last,
+                    args.heatmap_layers,
+                )
+
+        with (case_dir / "case.json").open("w", encoding="utf-8") as f:
+            json.dump({"case": case, "heatmap_stats": heatmap_stats, "d_part_label": annotation.get("d_part_label", {}).get(case["query_name"], [])}, f, indent=2, ensure_ascii=False)
+
+    print(f"Wrote failure analysis to {out_dir}")
+
+
 def parse_args() -> argparse.Namespace:
     repo_root = Path(__file__).resolve().parents[1]
     vrai_dir = repo_root / "VRAI"
@@ -266,6 +673,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-classes", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--device", type=str, default="")
+    parser.add_argument("--analyze-failures", action="store_true", help="Write detailed Rank-1 failure analysis for eval mode")
+    parser.add_argument("--analysis-output-dir", type=Path, default=Path("output/vrai_failure_analysis"))
+    parser.add_argument("--analysis-topk", type=int, default=20, help="Top-k retrievals kept per failure case")
+    parser.add_argument("--analysis-max-cases", type=int, default=200, help="Max failure cases written to JSONL")
+    parser.add_argument("--heatmap-cases", type=int, default=12, help="Number of failure cases with saved attention heatmaps")
+    parser.add_argument("--heatmap-layers", nargs="+", default=["ga1", "ga2", "ga3", "ga4"], choices=["ga1", "ga2", "ga3", "ga4"])
+    parser.add_argument("--contact-sheet-topk", type=int, default=5, help="Top-k gallery images shown next to query")
     return parser.parse_args()
 
 
@@ -416,6 +830,37 @@ def main() -> None:
         print(f"mAP:   {m_ap:.4f}")
         print(f"Rank-1:{rank1:.4f}")
         print(f"Rank-5:{rank5:.4f}")
+        if args.analyze_failures:
+            print("\n=== VRAI Failure Analysis ===")
+            failure_topk = max(args.analysis_topk, args.contact_sheet_topk, 5)
+            failures, summary = _collect_failure_cases(
+                q_feat=q_feat,
+                g_feat=g_feat,
+                query_ids=query_ids,
+                gallery_ids=gallery_ids,
+                query_idx=query_idx,
+                gallery_idx=gallery_idx,
+                image_names=image_names,
+                annotation=annotation,
+                split=args.split,
+                topk=failure_topk,
+                q_chunk_size=args.q_chunk_size,
+                use_fp16_sim=(not args.no_fp16_sim),
+            )
+            print(f"Rank-1 failures: {summary['num_rank1_failures']}/{summary['num_queries']}")
+            _write_failure_analysis(
+                failures=failures,
+                summary=summary,
+                image_names=image_names,
+                images_dir=images_dir,
+                annotation=annotation,
+                model=model,
+                args=args,
+                device=device,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                use_channels_last=use_channels_last,
+            )
         return
 
     if args.split == "train":
