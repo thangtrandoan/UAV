@@ -466,7 +466,7 @@ def _prepare_display_image(path: Path, size: int = 224) -> Image.Image:
         img = img.convert("RGB").resize((256, 256), Image.BILINEAR)
     left = (img.width - size) // 2
     top = (img.height - size) // 2
-    return img.crop((left, top, left + size, top + size))
+    return img.crop((left, top, left + size, top + size)).convert("RGB")
 
 
 def _draw_label(draw: ImageDraw.ImageDraw, xy: Tuple[int, int], text: str, fill: Tuple[int, int, int]) -> None:
@@ -553,8 +553,10 @@ def _save_attention_heatmaps(
         attn = attn_tensor[0, 0].numpy()
         low, high = np.percentile(attn, [1, 99])
         attn_norm = (attn - low) / max(high - low, 1e-6)
-        heat = Image.fromarray(_make_heat_color(attn_norm)).resize(base.size, Image.BILINEAR)
-        overlay = Image.blend(base, heat, alpha=0.45)
+        base_rgb = base.convert("RGB")
+        heat = Image.fromarray(_make_heat_color(attn_norm), mode="RGB")
+        heat = heat.resize(base_rgb.size, Image.BILINEAR).convert("RGB")
+        overlay = Image.blend(base_rgb, heat, alpha=0.45)
 
         y_idx, x_idx = np.indices(attn.shape)
         weight = np.maximum(attn - attn.min(), 0.0) + 1e-8
