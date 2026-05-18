@@ -501,11 +501,16 @@ def _save_contact_sheet(case: dict, images_dir: Path, out_path: Path, topk: int)
 
 
 def _make_heat_color(attn: np.ndarray) -> np.ndarray:
+    attn = np.asarray(attn)
+    attn = np.squeeze(attn)
+    if attn.ndim != 2:
+        raise ValueError(f"Expected a 2D attention map, got shape {attn.shape}")
+    attn = np.nan_to_num(attn, nan=0.0, posinf=1.0, neginf=0.0)
     attn = np.clip(attn, 0.0, 1.0)
     red = (255 * attn).astype(np.uint8)
     green = (255 * (1.0 - np.abs(attn - 0.5) * 2.0)).astype(np.uint8)
     blue = (255 * (1.0 - attn)).astype(np.uint8)
-    return np.stack([red, green, blue], axis=-1)
+    return np.ascontiguousarray(np.stack([red, green, blue], axis=-1))
 
 
 @torch.no_grad()
@@ -550,11 +555,17 @@ def _save_attention_heatmaps(
     out_dir.mkdir(parents=True, exist_ok=True)
     stats = []
     for layer, attn_tensor in captured.items():
-        attn = attn_tensor[0, 0].numpy()
+        attn = np.squeeze(attn_tensor[0].numpy())
+        if attn.ndim == 3:
+            attn = attn[0]
+        if attn.ndim != 2:
+            raise ValueError(f"Unexpected attention shape for {layer}: {tuple(attn_tensor.shape)}")
+        attn = np.nan_to_num(attn, nan=0.0, posinf=1.0, neginf=0.0)
         low, high = np.percentile(attn, [1, 99])
         attn_norm = (attn - low) / max(high - low, 1e-6)
         base_rgb = base.convert("RGB")
-        heat = Image.fromarray(_make_heat_color(attn_norm), mode="RGB")
+        heat_array = _make_heat_color(attn_norm)
+        heat = Image.fromarray(heat_array)
         heat = heat.resize(base_rgb.size, Image.BILINEAR).convert("RGB")
         overlay = Image.blend(base_rgb, heat, alpha=0.45)
 
