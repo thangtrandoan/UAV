@@ -766,6 +766,9 @@ def main() -> None:
 
     if args.grad_accum < 1:
         raise ValueError("--grad-accum must be >= 1")
+    if args.eval_every > 0 and not args.run_eval:
+        print("--eval-every was set, enabling --run-eval for VRU evaluation")
+        args.run_eval = True
     if args.dataset == "vrai" and args.run_eval:
         raise ValueError("--run-eval currently evaluates VRU splits only; use evaluate_vrai.py for VRAI evaluation")
 

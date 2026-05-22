@@ -1003,20 +1003,6 @@ def main() -> None:
         args.log_every,
     ).to(device)
 
-    if args.rerank:
-        print(
-            f"\nApplying re-ranking: query expansion over gallery neighbors "
-            f"(k1={args.rerank_k1}, alpha={args.rerank_alpha:.3f})"
-        )
-        q_feat, g_feat = _query_expansion_rerank_features(
-            q_feat=q_feat,
-            g_feat=g_feat,
-            k1=args.rerank_k1,
-            alpha=args.rerank_alpha,
-            q_chunk_size=args.q_chunk_size,
-            use_fp16_sim=(not args.no_fp16_sim),
-        )
-
     if args.mode == "eval":
         q_ids = torch.tensor(query_ids, dtype=torch.long, device=device)
         g_ids = torch.tensor(gallery_ids, dtype=torch.long, device=device)
@@ -1051,12 +1037,62 @@ def main() -> None:
             use_fp16_sim=(not args.no_fp16_sim),
         )
         _print_diagnostic_report(diagnostics)
+        analysis_q_feat = q_feat
+        analysis_g_feat = g_feat
+
+        if args.rerank:
+            print(
+                f"\nApplying re-ranking: query expansion over gallery neighbors "
+                f"(k1={args.rerank_k1}, alpha={args.rerank_alpha:.3f})"
+            )
+            rerank_q_feat, rerank_g_feat = _query_expansion_rerank_features(
+                q_feat=q_feat,
+                g_feat=g_feat,
+                k1=args.rerank_k1,
+                alpha=args.rerank_alpha,
+                q_chunk_size=args.q_chunk_size,
+                use_fp16_sim=(not args.no_fp16_sim),
+            )
+            m_ap, rank1, rank5 = evaluate_map_cmc(
+                rerank_q_feat,
+                q_ids,
+                rerank_g_feat,
+                g_ids,
+                topk=(1, 5),
+                q_chunk_size=args.q_chunk_size,
+                use_fp16_sim=(not args.no_fp16_sim),
+                verbose=True,
+            )
+
+            print("\n=== VRAI Evaluation (Re-ranked) ===")
+            print(f"Split: {args.split}")
+            print(f"mAP:   {m_ap:.4f}")
+            print(f"Rank-1:{rank1:.4f}")
+            print(f"Rank-5:{rank5:.4f}")
+            diagnostics = _collect_retrieval_diagnostics(
+                q_feat=rerank_q_feat,
+                g_feat=rerank_g_feat,
+                query_ids=query_ids,
+                gallery_ids=gallery_ids,
+                query_idx=query_idx,
+                gallery_idx=gallery_idx,
+                image_names=image_names,
+                annotation=annotation,
+                split=args.split,
+                topk=args.diagnostic_topk,
+                q_chunk_size=args.q_chunk_size,
+                use_fp16_sim=(not args.no_fp16_sim),
+            )
+            _print_diagnostic_report(diagnostics)
+            analysis_q_feat = rerank_q_feat
+            analysis_g_feat = rerank_g_feat
+
         if args.analyze_failures:
             print("\n=== VRAI Failure Analysis ===")
             failure_topk = max(args.analysis_topk, args.contact_sheet_topk, 5)
             failures, summary = _collect_failure_cases(
-                q_feat=q_feat,
-                g_feat=g_feat,
+                q_feat=analysis_q_feat,
+                g_feat=analysis_g_feat,
                 query_ids=query_ids,
                 gallery_ids=gallery_ids,
                 query_idx=query_idx,
@@ -1086,6 +1122,20 @@ def main() -> None:
 
     if args.split == "train":
         raise ValueError("Submission mode is intended for test/test-dev splits only")
+
+    if args.rerank:
+        print(
+            f"\nApplying re-ranking: query expansion over gallery neighbors "
+            f"(k1={args.rerank_k1}, alpha={args.rerank_alpha:.3f})"
+        )
+        q_feat, g_feat = _query_expansion_rerank_features(
+            q_feat=q_feat,
+            g_feat=g_feat,
+            k1=args.rerank_k1,
+            alpha=args.rerank_alpha,
+            q_chunk_size=args.q_chunk_size,
+            use_fp16_sim=(not args.no_fp16_sim),
+        )
 
     reid_result = _build_reid_result(
         q_feat=q_feat,
