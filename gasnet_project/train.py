@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import pickle
 import random
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
 
 from dataset import VRUDataset, build_query_gallery, read_split_file
@@ -24,6 +27,94 @@ BEST_METRIC_SPLIT_PRIORITY = {
 }
 
 
+@dataclass
+class VRAITrainSample:
+    img_path: Path
+    image_name: str
+    vehicle_id: int
+    camera: str
+    color: int
+    vehicle_type: int
+
+
+def _parse_vrai_train_id(image_name: str) -> int:
+    return int(Path(image_name).stem.split("_", 1)[0])
+
+
+def _parse_vrai_train_camera(image_name: str) -> str:
+    parts = Path(image_name).stem.split("_")
+    return parts[1] if len(parts) > 1 else ""
+
+
+def _lookup_attr(labels: dict, vehicle_id: int, image_name: str, default: int = -1) -> int:
+    if vehicle_id in labels:
+        return int(labels[vehicle_id])
+    if str(vehicle_id) in labels:
+        return int(labels[str(vehicle_id)])
+    if image_name in labels:
+        return int(labels[image_name])
+    return default
+
+
+def read_vrai_train_samples(vrai_dir: Path) -> List[VRAITrainSample]:
+    annotation_path = vrai_dir / "train_annotation.pkl"
+    images_dir = vrai_dir / "images_train"
+    with annotation_path.open("rb") as f:
+        annotation = pickle.load(f)
+    image_names = annotation["train_im_names"]
+    samples: List[VRAITrainSample] = []
+    for name in image_names:
+        vehicle_id = _parse_vrai_train_id(name)
+        samples.append(
+            VRAITrainSample(
+                img_path=images_dir / name,
+                image_name=name,
+                vehicle_id=vehicle_id,
+                camera=_parse_vrai_train_camera(name),
+                color=_lookup_attr(annotation.get("color_label", {}), vehicle_id, name),
+                vehicle_type=_lookup_attr(annotation.get("type_label", {}), vehicle_id, name),
+            )
+        )
+    return samples
+
+
+class VRAITrainDataset(Dataset):
+    def __init__(self, samples: List[VRAITrainSample], transform=None, label_map=None, max_retries: int = 3):
+        self.samples = samples
+        self.transform = transform
+        self.label_map = label_map or {}
+        self.max_retries = max_retries
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _load_rgb(self, path: Path):
+        last_err = None
+        for _ in range(self.max_retries):
+            try:
+                with Image.open(path) as img:
+                    return img.convert("RGB")
+            except OSError as exc:
+                last_err = exc
+        raise last_err
+
+    def __getitem__(self, idx):
+        tried = 0
+        cur_idx = idx
+        while tried < min(10, len(self.samples)):
+            s = self.samples[cur_idx]
+            try:
+                img = self._load_rgb(s.img_path)
+                if self.transform is not None:
+                    img = self.transform(img)
+                label = self.label_map[s.vehicle_id]
+                return img, label, s.vehicle_id, s.image_name, s.camera, s.color, s.vehicle_type
+            except OSError:
+                tried += 1
+                cur_idx = (cur_idx + 1) % len(self.samples)
+        raise RuntimeError(f"Cannot read image after retries, start_idx={idx}, path={self.samples[idx].img_path}")
+
+
 def _concat_relation(relation: torch.Tensor) -> torch.Tensor:
     return torch.cat([relation, relation.transpose(1, 2)], dim=1)
 
@@ -31,6 +122,7 @@ def _concat_relation(relation: torch.Tensor) -> torch.Tensor:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train GASNet on VRU")
     parser.add_argument("--data-root", type=Path, required=True, help="Path containing VRU folder")
+    parser.add_argument("--dataset", choices=["vru", "vrai"], default="vru", help="Training dataset layout")
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--base-batch-size", type=int, default=128)
@@ -62,6 +154,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-q-chunk-size", type=int, default=2048, help="Query chunk size for retrieval evaluation")
     parser.add_argument("--no-fp16-sim", action="store_true", help="Disable fp16/bf16 similarity matmul during evaluation")
     parser.add_argument("--eval-verbose", action="store_true", help="Print progress while evaluating the Big split")
+    parser.add_argument("--eval-rerank", action="store_true", help="Apply lightweight re-ranking during VRU evaluation")
+    parser.add_argument("--eval-rerank-k1", type=int, default=20)
+    parser.add_argument("--eval-rerank-alpha", type=float, default=0.3)
+    parser.add_argument("--disable-camera-balanced-sampler", action="store_true")
+    parser.add_argument("--disable-attribute-hard-negative-sampler", action="store_true")
+    parser.add_argument("--use-part-branch", action="store_true", help="Enable unsupervised horizontal part feature branch")
+    parser.add_argument("--num-parts", type=int, default=4, help="Number of horizontal stripes for the part branch")
+    parser.add_argument("--attention-reg-weight", type=float, default=0.0, help="Weight for spatial attention regularization")
+    parser.add_argument("--attention-target-mean", type=float, default=0.55, help="Target mean activation for spatial attention maps")
+    parser.add_argument("--attention-std-margin", type=float, default=0.08, help="Minimum per-map std encouraged for attention maps")
     return parser.parse_args()
 
 
@@ -106,6 +208,7 @@ class RGASpatial(nn.Module):
             nn.Conv1d(relation_features, 1, kernel_size=1, bias=False),
         )
         self.sigmoid = nn.Sigmoid()
+        self.last_attention: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, _, h, w = x.shape
@@ -122,6 +225,7 @@ class RGASpatial(nn.Module):
         channel_pooled = self.g(x).flatten(2).mean(dim=1, keepdim=True)
         attn = self.attn(torch.cat([relation, channel_pooled], dim=1))
         attn = self.sigmoid(attn).view(b, 1, h, w)
+        self.last_attention = attn
         return x * attn
 
 
@@ -310,8 +414,18 @@ class BNNeck(nn.Module):
 
 
 class GASNet(nn.Module):
-    def __init__(self, num_classes: int, use_pretrained: bool = True):
+    def __init__(
+        self,
+        num_classes: int,
+        use_pretrained: bool = True,
+        use_part_branch: bool = False,
+        num_parts: int = 4,
+    ):
         super().__init__()
+        if num_parts < 1:
+            raise ValueError("num_parts must be >= 1")
+        self.use_part_branch = use_part_branch
+        self.num_parts = num_parts
         weights = models.ResNet50_Weights.DEFAULT if use_pretrained else None
         base = models.resnet50(weights=weights)
         
@@ -333,9 +447,40 @@ class GASNet(nn.Module):
         self.gap = nn.AdaptiveAvgPool2d(1)
         self.bnneck_global = BNNeck(2048)
         self.bnneck_fs = BNNeck(512)
+        if self.use_part_branch:
+            self.part_reduce = nn.Sequential(
+                nn.Linear(2048 * num_parts, 512, bias=False),
+                nn.BatchNorm1d(512),
+                nn.ReLU(inplace=True),
+            )
+            self.bnneck_part = BNNeck(512)
+            self.classifier_part = nn.Linear(512, num_classes, bias=False)
         
         self.classifier_global = nn.Linear(2048, num_classes, bias=False)
         self.classifier_fs = nn.Linear(512, num_classes, bias=False)
+
+    def _part_pool(self, x: torch.Tensor) -> torch.Tensor:
+        stripes = torch.chunk(x, self.num_parts, dim=2)
+        pooled = [self.gap(stripe).flatten(1) for stripe in stripes]
+        return self.part_reduce(torch.cat(pooled, dim=1))
+
+    def attention_regularization_loss(
+        self,
+        target_mean: float = 0.55,
+        std_margin: float = 0.08,
+    ) -> torch.Tensor:
+        losses = []
+        for block in (self.ga1, self.ga2, self.ga3, self.ga4):
+            attn = block.rga_s.last_attention
+            if attn is None:
+                continue
+            flat = attn.flatten(1)
+            mean_loss = (flat.mean(dim=1) - target_mean).pow(2)
+            std_loss = F.relu(std_margin - flat.std(dim=1, unbiased=False)).pow(2)
+            losses.append((mean_loss + std_loss).mean())
+        if not losses:
+            return next(self.parameters()).sum() * 0.0
+        return torch.stack(losses).mean()
 
     def forward(self, x: torch.Tensor):
         x = self.stem(x)
@@ -360,17 +505,49 @@ class GASNet(nn.Module):
 
         logits_global = self.classifier_global(bn_global)
         logits_fs = self.classifier_fs(bn_fs)
+        if self.use_part_branch:
+            part_feat = self._part_pool(x)
+            bn_part = self.bnneck_part(part_feat)
+            logits_part = self.classifier_part(bn_part)
 
         if self.training:
+            if self.use_part_branch:
+                return (global_feat, fs_feat, part_feat), (logits_global, logits_fs, logits_part)
             return (global_feat, fs_feat), (logits_global, logits_fs)
+        if self.use_part_branch:
+            return bn_global, bn_fs, bn_part
         return bn_global, bn_fs
 
 
-def batch_hard_triplet_loss(feat: torch.Tensor, labels: torch.Tensor, margin: float = 0.3) -> torch.Tensor:
+def batch_hard_triplet_loss(
+    feat: torch.Tensor,
+    labels: torch.Tensor,
+    margin: float = 0.3,
+    cameras=None,
+    colors: torch.Tensor | None = None,
+    vehicle_types: torch.Tensor | None = None,
+) -> torch.Tensor:
     dist = torch.cdist(feat, feat, p=2)
     labels = labels.view(-1, 1)
     mask_pos = labels.eq(labels.t())
     mask_neg = ~mask_pos
+    if cameras is not None:
+        cam_list = list(cameras)
+        cam_equal = torch.tensor(
+            [[a == b for b in cam_list] for a in cam_list],
+            dtype=torch.bool,
+            device=feat.device,
+        )
+        cross_camera_pos = mask_pos & (~cam_equal)
+        has_cross_camera_pos = cross_camera_pos.sum(dim=1) > 0
+        mask_pos = torch.where(has_cross_camera_pos.view(-1, 1), cross_camera_pos, mask_pos)
+
+    if colors is not None and vehicle_types is not None:
+        colors = colors.to(feat.device).view(-1, 1)
+        vehicle_types = vehicle_types.to(feat.device).view(-1, 1)
+        same_attr_neg = mask_neg & colors.eq(colors.t()) & vehicle_types.eq(vehicle_types.t())
+        has_same_attr_neg = same_attr_neg.sum(dim=1) > 0
+        mask_neg = torch.where(has_same_attr_neg.view(-1, 1), same_attr_neg, mask_neg)
 
     dist_pos = dist.clone()
     dist_pos[~mask_pos] = -1.0
@@ -418,9 +595,22 @@ def make_loader(
 
 
 class PKBatchSampler(torch.utils.data.Sampler[List[int]]):
-    def __init__(self, labels: List[int], p: int, k: int):
+    def __init__(
+        self,
+        labels: List[int],
+        p: int,
+        k: int,
+        cameras: List[str] | None = None,
+        colors: List[int] | None = None,
+        vehicle_types: List[int] | None = None,
+        camera_balanced: bool = False,
+        attribute_hard_negative: bool = False,
+    ):
         self.p = p
         self.k = k
+        self.cameras = cameras
+        self.camera_balanced = camera_balanced and cameras is not None
+        self.attribute_hard_negative = attribute_hard_negative and colors is not None and vehicle_types is not None
         label_to_indices: dict[int, List[int]] = {}
         for idx, label in enumerate(labels):
             label_to_indices.setdefault(label, []).append(idx)
@@ -429,19 +619,67 @@ class PKBatchSampler(torch.utils.data.Sampler[List[int]]):
         self.labels = [label for label, idxs in label_to_indices.items() if len(idxs) >= k]
         if len(self.labels) < p:
             raise ValueError(f"Need at least {p} identities with >= {k} samples, got {len(self.labels)}")
+        self.attr_to_labels: dict[tuple[int, int], List[int]] = {}
+        if self.attribute_hard_negative:
+            label_to_attr = {}
+            for idx, label in enumerate(labels):
+                if label in self.labels and label not in label_to_attr:
+                    label_to_attr[label] = (int(colors[idx]), int(vehicle_types[idx]))
+            for label, attr in label_to_attr.items():
+                self.attr_to_labels.setdefault(attr, []).append(label)
+            self.attr_buckets = [bucket for bucket in self.attr_to_labels.values() if len(bucket) >= 2]
+        else:
+            self.attr_buckets = []
 
     def __len__(self) -> int:
         return len(self.labels) // self.p
 
+    def _sample_indices_for_label(self, label: int) -> List[int]:
+        indices = self.label_to_indices[label]
+        if not self.camera_balanced:
+            return random.sample(indices, self.k)
+
+        by_camera: dict[str, List[int]] = {}
+        for idx in indices:
+            by_camera.setdefault(self.cameras[idx], []).append(idx)
+        for camera_indices in by_camera.values():
+            random.shuffle(camera_indices)
+        camera_keys = list(by_camera.keys())
+        random.shuffle(camera_keys)
+        selected: List[int] = []
+        while len(selected) < self.k and any(by_camera[camera] for camera in camera_keys):
+            for camera in camera_keys:
+                if len(selected) >= self.k:
+                    break
+                if by_camera[camera]:
+                    selected.append(by_camera[camera].pop())
+        if len(selected) < self.k:
+            remaining = [idx for idx in indices if idx not in set(selected)]
+            selected.extend(random.sample(remaining, min(len(remaining), self.k - len(selected))))
+        return selected[: self.k]
+
+    def _make_batch_labels(self, remaining: set[int]) -> List[int]:
+        if self.attribute_hard_negative and self.attr_buckets and random.random() < 0.8:
+            bucket = [label for label in random.choice(self.attr_buckets) if label in remaining]
+            random.shuffle(bucket)
+            batch_labels = bucket[: self.p]
+            if len(batch_labels) < self.p:
+                pool = list(remaining.difference(batch_labels))
+                random.shuffle(pool)
+                batch_labels.extend(pool[: self.p - len(batch_labels)])
+            return batch_labels
+        pool = list(remaining)
+        random.shuffle(pool)
+        return pool[: self.p]
+
     def __iter__(self):
-        labels = self.labels.copy()
-        random.shuffle(labels)
-        for i in range(0, len(labels) - self.p + 1, self.p):
-            batch_labels = labels[i : i + self.p]
+        remaining = set(self.labels)
+        while len(remaining) >= self.p:
+            batch_labels = self._make_batch_labels(remaining)
             batch: List[int] = []
             for label in batch_labels:
-                indices = self.label_to_indices[label]
-                batch.extend(random.sample(indices, self.k))
+                batch.extend(self._sample_indices_for_label(label))
+                remaining.discard(label)
             yield batch
 
 
@@ -455,10 +693,28 @@ def make_pk_loader(
     pin_memory: bool = False,
     persistent_workers: bool = False,
     prefetch_factor: int = 2,
+    cameras: List[str] | None = None,
+    colors: List[int] | None = None,
+    vehicle_types: List[int] | None = None,
+    camera_balanced: bool = False,
+    attribute_hard_negative: bool = False,
+    dataset_cls=VRUDataset,
 ):
     labels = [label_map[s.vehicle_id] for s in samples]
-    batch_sampler = PKBatchSampler(labels, p=p, k=k)
-    ds = VRUDataset(samples=samples, transform=transform, relabel=True, label_map=label_map, max_retries=3)
+    batch_sampler = PKBatchSampler(
+        labels,
+        p=p,
+        k=k,
+        cameras=cameras,
+        colors=colors,
+        vehicle_types=vehicle_types,
+        camera_balanced=camera_balanced,
+        attribute_hard_negative=attribute_hard_negative,
+    )
+    if dataset_cls is VRAITrainDataset:
+        ds = dataset_cls(samples=samples, transform=transform, label_map=label_map, max_retries=3)
+    else:
+        ds = dataset_cls(samples=samples, transform=transform, relabel=True, label_map=label_map, max_retries=3)
     loader_kwargs = dict(pin_memory=pin_memory)
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = persistent_workers
@@ -510,6 +766,8 @@ def main() -> None:
 
     if args.grad_accum < 1:
         raise ValueError("--grad-accum must be >= 1")
+    if args.dataset == "vrai" and args.run_eval:
+        raise ValueError("--run-eval currently evaluates VRU splits only; use evaluate_vrai.py for VRAI evaluation")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_channels_last = torch.cuda.is_available() and (not args.no_channels_last)
@@ -533,11 +791,21 @@ def main() -> None:
     else:
         save_best = args.run_eval and args.save_best
 
-    vru_dir = args.data_root / "VRU"
-    pic_dir = vru_dir / "Pic"
-    split_dir = vru_dir / "train_test_split"
-
-    train_samples = read_split_file(pic_dir, split_dir / "train_list.txt")
+    if args.dataset == "vrai":
+        train_samples = read_vrai_train_samples(args.data_root / "VRAI")
+        dataset_cls = VRAITrainDataset
+        train_cameras = [s.camera for s in train_samples]
+        train_colors = [s.color for s in train_samples]
+        train_types = [s.vehicle_type for s in train_samples]
+    else:
+        vru_dir = args.data_root / "VRU"
+        pic_dir = vru_dir / "Pic"
+        split_dir = vru_dir / "train_test_split"
+        train_samples = read_split_file(pic_dir, split_dir / "train_list.txt")
+        dataset_cls = VRUDataset
+        train_cameras = None
+        train_colors = None
+        train_types = None
     train_ids = sorted({s.vehicle_id for s in train_samples})
     train_label_map = {vid: i for i, vid in enumerate(train_ids)}
     num_classes = len(train_label_map)
@@ -573,9 +841,20 @@ def main() -> None:
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
+        cameras=train_cameras,
+        colors=train_colors,
+        vehicle_types=train_types,
+        camera_balanced=(args.dataset == "vrai" and not args.disable_camera_balanced_sampler),
+        attribute_hard_negative=(args.dataset == "vrai" and not args.disable_attribute_hard_negative_sampler),
+        dataset_cls=dataset_cls,
     )
 
-    model = GASNet(num_classes=num_classes, use_pretrained=not args.no_pretrained).to(device)
+    model = GASNet(
+        num_classes=num_classes,
+        use_pretrained=not args.no_pretrained,
+        use_part_branch=args.use_part_branch,
+        num_parts=args.num_parts,
+    ).to(device)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
 
@@ -604,7 +883,10 @@ def main() -> None:
     print(
         f"device={device}, amp={use_amp}, amp_dtype={amp_dtype}, channels_last={use_channels_last}, "
         f"batch={batch_size}, lr={learning_rate:.6f}, grad_accum={args.grad_accum}, "
-        f"workers={args.num_workers}, pin_memory={pin_memory}, persistent_workers={persistent_workers}"
+        f"workers={args.num_workers}, pin_memory={pin_memory}, persistent_workers={persistent_workers}, "
+        f"dataset={args.dataset}, camera_balanced={args.dataset == 'vrai' and not args.disable_camera_balanced_sampler}, "
+        f"attr_hard_negative={args.dataset == 'vrai' and not args.disable_attribute_hard_negative_sampler}, "
+        f"part_branch={args.use_part_branch}, attention_reg_weight={args.attention_reg_weight}"
     )
 
     model.train()
@@ -621,7 +903,16 @@ def main() -> None:
         running = 0.0
         t0 = time.time()
         optimizer.zero_grad(set_to_none=True)
-        for step, (imgs, labels, _, _) in enumerate(train_loader, 1):
+        for step, batch in enumerate(train_loader, 1):
+            if args.dataset == "vrai":
+                imgs, labels, _, _, cameras, colors, vehicle_types = batch
+                colors = colors.to(device, non_blocking=True)
+                vehicle_types = vehicle_types.to(device, non_blocking=True)
+            else:
+                imgs, labels, _, _ = batch
+                cameras = None
+                colors = None
+                vehicle_types = None
             if use_channels_last:
                 imgs = imgs.to(device, non_blocking=True, memory_format=torch.channels_last)
             else:
@@ -629,10 +920,26 @@ def main() -> None:
             labels = labels.to(device, non_blocking=True)
 
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                (g_feat, f_feat), (logits_g, logits_f) = model(imgs)
-                loss_id = ce_loss(logits_g, labels) + ce_loss(logits_f, labels)
-                loss_tri = batch_hard_triplet_loss(g_feat, labels) + batch_hard_triplet_loss(f_feat, labels)
+                feats, logits = model(imgs)
+                loss_id = sum(ce_loss(logit, labels) for logit in logits)
+                loss_tri = sum(
+                    batch_hard_triplet_loss(
+                        feat,
+                        labels,
+                        cameras=cameras,
+                        colors=colors,
+                        vehicle_types=vehicle_types,
+                    )
+                    for feat in feats
+                )
                 loss = loss_id + 0.5 * loss_tri
+                if args.attention_reg_weight > 0:
+                    base_model = getattr(model, "_orig_mod", model)
+                    loss_attn = base_model.attention_regularization_loss(
+                        target_mean=args.attention_target_mean,
+                        std_margin=args.attention_std_margin,
+                    )
+                    loss = loss + args.attention_reg_weight * loss_attn
 
             loss_to_backprop = loss / args.grad_accum
             if use_amp and use_scaler:
@@ -683,6 +990,9 @@ def main() -> None:
                 q_chunk_size=args.eval_q_chunk_size,
                 use_fp16_sim=(not args.no_fp16_sim),
                 verbose_eval=args.eval_verbose,
+                rerank=args.eval_rerank,
+                rerank_k1=args.eval_rerank_k1,
+                rerank_alpha=args.eval_rerank_alpha,
             )
             print_eval_report(metrics, title=f"Evaluation @ Epoch {epoch}")
             if save_best:
@@ -715,6 +1025,9 @@ def main() -> None:
             q_chunk_size=args.eval_q_chunk_size,
             use_fp16_sim=(not args.no_fp16_sim),
             verbose_eval=args.eval_verbose,
+            rerank=args.eval_rerank,
+            rerank_k1=args.eval_rerank_k1,
+            rerank_alpha=args.eval_rerank_alpha,
         )
         print_eval_report(metrics, title="Final Evaluation")
         if save_best:

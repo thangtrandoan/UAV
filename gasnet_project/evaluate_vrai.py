@@ -125,6 +125,16 @@ def _parse_train_camera(image_name: str) -> str:
     return parts[1]
 
 
+def _parse_camera(image_name: str, split: str) -> str:
+    if split == "train":
+        return _parse_train_camera(image_name)
+    stem = Path(image_name).stem
+    parts = stem.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].upper().startswith("C"):
+        return parts[1]
+    return ""
+
+
 def _parse_train_frame(image_name: str) -> str:
     parts = Path(image_name).stem.split("_")
     if len(parts) < 3:
@@ -172,6 +182,152 @@ def _attr_mismatches(a: dict, b: dict) -> List[str]:
         if a.get(key) is not None and b.get(key) is not None and a[key] != b[key]:
             mismatches.append(key)
     return mismatches
+
+
+@torch.no_grad()
+def _query_expansion_rerank_features(
+    q_feat: torch.Tensor,
+    g_feat: torch.Tensor,
+    k1: int,
+    alpha: float,
+    q_chunk_size: int,
+    use_fp16_sim: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Lightweight re-ranking by query expansion over gallery neighbors.
+
+    This avoids materializing the full query+gallery distance matrix, which is
+    too large for VRAI train evaluation, while still using local neighborhood
+    context before mAP/CMC and top-k diagnostics are computed.
+    """
+    if k1 < 1:
+        return q_feat, g_feat
+
+    device = q_feat.device if q_feat.is_cuda else g_feat.device
+    q = F.normalize(q_feat.to(device=device, dtype=torch.float32), dim=1)
+    g = F.normalize(g_feat.to(device=device, dtype=torch.float32), dim=1)
+    k = min(k1, g.size(0))
+
+    sim_dtype = None
+    if device.type == "cuda" and use_fp16_sim:
+        sim_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    q_mm = q.to(sim_dtype) if sim_dtype is not None else q
+    g_mm = g.to(sim_dtype) if sim_dtype is not None else g
+
+    q_new_chunks = []
+    for start in range(0, q.size(0), q_chunk_size):
+        end = min(start + q_chunk_size, q.size(0))
+        sim = q_mm[start:end] @ g_mm.t()
+        if sim_dtype is not None:
+            sim = sim.float()
+        idx = torch.topk(sim, k=k, dim=1, largest=True, sorted=False).indices
+        neighbor = g[idx].mean(dim=1)
+        q_new_chunks.append(F.normalize(q[start:end] + alpha * neighbor, dim=1))
+    q_new = torch.cat(q_new_chunks, dim=0)
+
+    g_new_chunks = []
+    for start in range(0, g.size(0), q_chunk_size):
+        end = min(start + q_chunk_size, g.size(0))
+        sim = g_mm[start:end] @ g_mm.t()
+        if sim_dtype is not None:
+            sim = sim.float()
+        idx = torch.topk(sim, k=k, dim=1, largest=True, sorted=False).indices
+        neighbor = g[idx].mean(dim=1)
+        g_new_chunks.append(F.normalize(g[start:end] + alpha * neighbor, dim=1))
+    g_new = torch.cat(g_new_chunks, dim=0)
+    return q_new, g_new
+
+
+@torch.no_grad()
+def _collect_retrieval_diagnostics(
+    q_feat: torch.Tensor,
+    g_feat: torch.Tensor,
+    query_ids: List[int],
+    gallery_ids: List[int],
+    query_idx: List[int],
+    gallery_idx: List[int],
+    image_names: List[str],
+    annotation: dict,
+    split: str,
+    topk: int,
+    q_chunk_size: int,
+    use_fp16_sim: bool,
+) -> dict:
+    q = F.normalize(q_feat.float(), dim=1)
+    g = F.normalize(g_feat.float(), dim=1)
+    q_ids = torch.tensor(query_ids, dtype=torch.long, device=q.device)
+    g_ids = torch.tensor(gallery_ids, dtype=torch.long, device=q.device)
+    k = min(max(10, topk), g.size(0))
+
+    sim_dtype = None
+    if q.is_cuda and use_fp16_sim:
+        sim_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    q_mm = q.to(sim_dtype) if sim_dtype is not None else q
+    g_mm = g.to(sim_dtype) if sim_dtype is not None else g
+
+    summary = {
+        "num_queries": len(query_ids),
+        "num_rank1_failures": 0,
+        "no_match_in_topk": 0,
+        "gt_rank_2_10": 0,
+        "gt10": 0,
+        "type_mismatch": 0,
+        "color_mismatch": 0,
+        "cross_camera_failures": 0,
+        "diagnostic_topk": k,
+    }
+
+    for start in range(0, q_mm.size(0), q_chunk_size):
+        end = min(start + q_chunk_size, q_mm.size(0))
+        sim = q_mm[start:end] @ g_mm.t()
+        if sim_dtype is not None:
+            sim = sim.float()
+        order = torch.topk(sim, k=k, dim=1, largest=True, sorted=True).indices
+        matches = g_ids[order] == q_ids[start:end].unsqueeze(1)
+
+        for local_row in range(order.size(0)):
+            q_local = start + local_row
+            match_positions = torch.where(matches[local_row])[0]
+            first_correct_rank = int(match_positions[0].item() + 1) if match_positions.numel() else None
+            if first_correct_rank is None:
+                summary["no_match_in_topk"] += 1
+            elif 2 <= first_correct_rank <= 10:
+                summary["gt_rank_2_10"] += 1
+            elif first_correct_rank > 10:
+                summary["gt10"] += 1
+
+            pred_gallery_local = int(order[local_row, 0].item())
+            q_id = int(query_ids[q_local])
+            pred_id = int(gallery_ids[pred_gallery_local])
+            if pred_id == q_id:
+                continue
+
+            summary["num_rank1_failures"] += 1
+            q_name = image_names[query_idx[q_local]]
+            pred_name = image_names[gallery_idx[pred_gallery_local]]
+            q_attrs = _get_attrs(annotation, q_name, split)
+            pred_attrs = _get_attrs(annotation, pred_name, split)
+            mismatches = set(_attr_mismatches(q_attrs, pred_attrs))
+            if "type_label" in mismatches:
+                summary["type_mismatch"] += 1
+            if "color_label" in mismatches:
+                summary["color_mismatch"] += 1
+            if _parse_camera(q_name, split) != _parse_camera(pred_name, split):
+                summary["cross_camera_failures"] += 1
+
+    return summary
+
+
+def _print_diagnostic_report(summary: dict) -> None:
+    total = max(1, int(summary["num_queries"]))
+    failures = max(1, int(summary["num_rank1_failures"]))
+    topk = int(summary["diagnostic_topk"])
+    print("\n=== VRAI Retrieval Diagnostics ===")
+    print(f"Rank-1 failures:          {summary['num_rank1_failures']}/{summary['num_queries']}")
+    print(f"no_match_in_top{topk}:       {summary['no_match_in_topk'] / total:.4f}")
+    print(f"gt rank 2-10 rate:        {summary['gt_rank_2_10'] / total:.4f}")
+    print(f"type mismatch rate:       {summary['type_mismatch'] / failures:.4f}")
+    print(f"color mismatch rate:      {summary['color_mismatch'] / failures:.4f}")
+    print(f"cross-camera failure rate:{summary['cross_camera_failures'] / failures:.4f}")
 
 
 def _human_obvious_hint(mismatches: List[str], same_camera: bool, q_parts: int, pred_parts: int) -> str:
@@ -255,8 +411,10 @@ def _extract_features(
             autocast_kwargs["dtype"] = amp_dtype
 
         with torch.autocast(**autocast_kwargs):
-            bn_global, bn_fs = model(imgs)
-            emb = torch.cat([bn_global, bn_fs], dim=1)
+            outputs = model(imgs)
+            if isinstance(outputs, torch.Tensor):
+                outputs = (outputs,)
+            emb = torch.cat(list(outputs), dim=1)
 
         feats.append(emb.float())
         if log_every > 0 and (step == 1 or step % log_every == 0 or step == total):
@@ -696,6 +854,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-classes", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--device", type=str, default="")
+    parser.add_argument("--rerank", action="store_true", help="Apply lightweight gallery-neighbor query expansion re-ranking")
+    parser.add_argument("--rerank-k1", type=int, default=20, help="Number of gallery neighbors used for re-ranking")
+    parser.add_argument("--rerank-alpha", type=float, default=0.3, help="Neighbor feature weight used for re-ranking")
+    parser.add_argument("--diagnostic-topk", type=int, default=20, help="Top-k used for no_match_in_topk diagnostics")
+    parser.add_argument("--use-part-branch", action="store_true", help="Load/evaluate a checkpoint trained with the part branch")
+    parser.add_argument("--num-parts", type=int, default=4, help="Number of horizontal stripes used by the part branch")
     parser.add_argument("--analyze-failures", action="store_true", help="Write detailed Rank-1 failure analysis for eval mode")
     parser.add_argument("--analysis-output-dir", type=Path, default=Path("output/vrai_failure_analysis"))
     parser.add_argument("--analysis-topk", type=int, default=20, help="Top-k retrievals kept per failure case")
@@ -807,7 +971,12 @@ def main() -> None:
         if args.num_classes is None:
             raise
         num_classes = args.num_classes
-    model = GASNet(num_classes=num_classes, use_pretrained=False).to(device)
+    model = GASNet(
+        num_classes=num_classes,
+        use_pretrained=False,
+        use_part_branch=args.use_part_branch,
+        num_parts=args.num_parts,
+    ).to(device)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
     model_state = model.state_dict()
@@ -834,6 +1003,20 @@ def main() -> None:
         args.log_every,
     ).to(device)
 
+    if args.rerank:
+        print(
+            f"\nApplying re-ranking: query expansion over gallery neighbors "
+            f"(k1={args.rerank_k1}, alpha={args.rerank_alpha:.3f})"
+        )
+        q_feat, g_feat = _query_expansion_rerank_features(
+            q_feat=q_feat,
+            g_feat=g_feat,
+            k1=args.rerank_k1,
+            alpha=args.rerank_alpha,
+            q_chunk_size=args.q_chunk_size,
+            use_fp16_sim=(not args.no_fp16_sim),
+        )
+
     if args.mode == "eval":
         q_ids = torch.tensor(query_ids, dtype=torch.long, device=device)
         g_ids = torch.tensor(gallery_ids, dtype=torch.long, device=device)
@@ -853,6 +1036,21 @@ def main() -> None:
         print(f"mAP:   {m_ap:.4f}")
         print(f"Rank-1:{rank1:.4f}")
         print(f"Rank-5:{rank5:.4f}")
+        diagnostics = _collect_retrieval_diagnostics(
+            q_feat=q_feat,
+            g_feat=g_feat,
+            query_ids=query_ids,
+            gallery_ids=gallery_ids,
+            query_idx=query_idx,
+            gallery_idx=gallery_idx,
+            image_names=image_names,
+            annotation=annotation,
+            split=args.split,
+            topk=args.diagnostic_topk,
+            q_chunk_size=args.q_chunk_size,
+            use_fp16_sim=(not args.no_fp16_sim),
+        )
+        _print_diagnostic_report(diagnostics)
         if args.analyze_failures:
             print("\n=== VRAI Failure Analysis ===")
             failure_topk = max(args.analysis_topk, args.contact_sheet_topk, 5)

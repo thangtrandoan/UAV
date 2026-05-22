@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from dataset import Sample, VRUDataset, build_query_gallery, read_split_file
@@ -45,6 +46,50 @@ def _make_eval_loader(
 
 
 @torch.no_grad()
+def _query_expansion_rerank_features(
+    q_feat: torch.Tensor,
+    g_feat: torch.Tensor,
+    k1: int,
+    alpha: float,
+    q_chunk_size: int,
+    use_fp16_sim: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if k1 < 1:
+        return q_feat, g_feat
+
+    device = q_feat.device if q_feat.is_cuda else g_feat.device
+    q = F.normalize(q_feat.to(device=device, dtype=torch.float32), dim=1)
+    g = F.normalize(g_feat.to(device=device, dtype=torch.float32), dim=1)
+    k = min(k1, g.size(0))
+
+    sim_dtype = None
+    if device.type == "cuda" and use_fp16_sim:
+        sim_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    q_mm = q.to(sim_dtype) if sim_dtype is not None else q
+    g_mm = g.to(sim_dtype) if sim_dtype is not None else g
+
+    q_new_chunks = []
+    for start in range(0, q.size(0), q_chunk_size):
+        end = min(start + q_chunk_size, q.size(0))
+        sim = q_mm[start:end] @ g_mm.t()
+        if sim_dtype is not None:
+            sim = sim.float()
+        idx = torch.topk(sim, k=k, dim=1, largest=True, sorted=False).indices
+        q_new_chunks.append(F.normalize(q[start:end] + alpha * g[idx].mean(dim=1), dim=1))
+
+    g_new_chunks = []
+    for start in range(0, g.size(0), q_chunk_size):
+        end = min(start + q_chunk_size, g.size(0))
+        sim = g_mm[start:end] @ g_mm.t()
+        if sim_dtype is not None:
+            sim = sim.float()
+        idx = torch.topk(sim, k=k, dim=1, largest=True, sorted=False).indices
+        g_new_chunks.append(F.normalize(g[start:end] + alpha * g[idx].mean(dim=1), dim=1))
+
+    return torch.cat(q_new_chunks, dim=0), torch.cat(g_new_chunks, dim=0)
+
+
+@torch.no_grad()
 def _extract_features(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -71,8 +116,10 @@ def _extract_features(
             autocast_kwargs["dtype"] = amp_dtype
 
         with torch.autocast(**autocast_kwargs):
-            bn_global, bn_fs = model(imgs)
-            emb = torch.cat([bn_global, bn_fs], dim=1)
+            outputs = model(imgs)
+            if isinstance(outputs, torch.Tensor):
+                outputs = (outputs,)
+            emb = torch.cat(list(outputs), dim=1)
 
         feats.append(emb.float().to(out_device, non_blocking=(out_device.type == "cuda")))
         ids.append(vehicle_ids.to(out_device, non_blocking=(out_device.type == "cuda")))
@@ -97,6 +144,9 @@ def run_eval(
     q_chunk_size: int = 2048,
     use_fp16_sim: bool = True,
     verbose_eval: bool = False,
+    rerank: bool = False,
+    rerank_k1: int = 20,
+    rerank_alpha: float = 0.3,
 ) -> Dict[str, Tuple[float, float, float]]:
     vru_dir = data_root / "VRU"
     pic_dir = vru_dir / "Pic"
@@ -149,6 +199,15 @@ def run_eval(
             use_channels_last,
             output_device=feat_out_device,
         )
+        if rerank:
+            q_feat, g_feat = _query_expansion_rerank_features(
+                q_feat=q_feat,
+                g_feat=g_feat,
+                k1=rerank_k1,
+                alpha=rerank_alpha,
+                q_chunk_size=q_chunk_size,
+                use_fp16_sim=use_fp16_sim,
+            )
 
         m_ap, rank1, rank5 = evaluate_map_cmc(
             q_feat,
