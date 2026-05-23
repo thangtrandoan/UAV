@@ -862,6 +862,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-parts", type=int, default=4, help="Number of horizontal stripes used by the part branch")
     parser.add_argument("--use-gem", action="store_true", help="Load/evaluate a checkpoint trained with GeM pooling")
     parser.add_argument("--gem-p", type=float, default=3.0, help="GeM pooling exponent")
+    parser.add_argument("--backbone", choices=["resnet50", "resnet50_ibn"], default="resnet50")
     parser.add_argument("--tta-flip", action="store_true", help="Average original and horizontal-flip features")
     parser.add_argument("--analyze-failures", action="store_true", help="Write detailed Rank-1 failure analysis for eval mode")
     parser.add_argument("--analysis-output-dir", type=Path, default=Path("output/vrai_failure_analysis"))
@@ -981,6 +982,7 @@ def main() -> None:
         num_parts=args.num_parts,
         use_gem=args.use_gem,
         gem_p=args.gem_p,
+        backbone=args.backbone,
     ).to(device)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)

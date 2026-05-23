@@ -162,6 +162,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pk-k", type=int, default=4, help="Images per identity in PK sampler")
     parser.add_argument("--use-gem", action="store_true", help="Use GeM pooling instead of average pooling")
     parser.add_argument("--gem-p", type=float, default=3.0, help="GeM pooling exponent")
+    parser.add_argument("--backbone", choices=["resnet50", "resnet50_ibn"], default="resnet50")
     parser.add_argument("--disable-camera-balanced-sampler", action="store_true")
     parser.add_argument("--disable-attribute-hard-negative-sampler", action="store_true")
     parser.add_argument("--use-part-branch", action="store_true", help="Enable unsupervised horizontal part feature branch")
@@ -428,6 +429,109 @@ class GeMPool(nn.Module):
         return F.avg_pool2d(x.clamp(min=self.eps).pow(self.p), kernel_size=x.shape[-2:]).pow(1.0 / self.p)
 
 
+class IBN(nn.Module):
+    def __init__(self, channels: int, ratio: float = 0.5):
+        super().__init__()
+        split = int(channels * ratio)
+        self.split = split
+        self.in_norm = nn.InstanceNorm2d(split, affine=True)
+        self.bn_norm = nn.BatchNorm2d(channels - split)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = torch.split(x, [self.split, x.size(1) - self.split], dim=1)
+        return torch.cat([self.in_norm(x1), self.bn_norm(x2)], dim=1)
+
+
+class BottleneckIBN(nn.Module):
+    expansion = 4
+
+    def __init__(
+        self,
+        inplanes: int,
+        planes: int,
+        stride: int = 1,
+        downsample: nn.Module | None = None,
+        use_ibn: bool = True,
+    ):
+        super().__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
+        self.bn1 = IBN(planes) if use_ibn else nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv3 = nn.Conv2d(planes, planes * self.expansion, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        return self.relu(out)
+
+
+class ResNetIBN(nn.Module):
+    def __init__(self, layers: tuple[int, int, int, int] = (3, 4, 6, 3)):
+        super().__init__()
+        self.inplanes = 64
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(64, layers[0], use_ibn=True)
+        self.layer2 = self._make_layer(128, layers[1], stride=2, use_ibn=True)
+        self.layer3 = self._make_layer(256, layers[2], stride=2, use_ibn=True)
+        self.layer4 = self._make_layer(512, layers[3], stride=2, use_ibn=False)
+
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(module, (nn.BatchNorm2d, nn.InstanceNorm2d)):
+                if module.weight is not None:
+                    nn.init.constant_(module.weight, 1)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+
+    def _make_layer(self, planes: int, blocks: int, stride: int = 1, use_ibn: bool = True) -> nn.Sequential:
+        downsample = None
+        if stride != 1 or self.inplanes != planes * BottleneckIBN.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * BottleneckIBN.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * BottleneckIBN.expansion),
+            )
+
+        layers = [BottleneckIBN(self.inplanes, planes, stride=stride, downsample=downsample, use_ibn=use_ibn)]
+        self.inplanes = planes * BottleneckIBN.expansion
+        for _ in range(1, blocks):
+            layers.append(BottleneckIBN(self.inplanes, planes, use_ibn=use_ibn))
+        return nn.Sequential(*layers)
+
+
+def _load_matching_resnet50_weights(model: nn.Module) -> None:
+    weights = models.ResNet50_Weights.DEFAULT
+    state = models.resnet50(weights=weights).state_dict()
+    model_state = model.state_dict()
+    filtered = {k: v for k, v in state.items() if k in model_state and model_state[k].shape == v.shape}
+    missing = len(model_state) - len(filtered)
+    model.load_state_dict(filtered, strict=False)
+    print(f"Loaded {len(filtered)} matching ResNet50 weights into ResNet50-IBN; skipped {missing} tensors")
+
+
 class GASNet(nn.Module):
     def __init__(
         self,
@@ -437,14 +541,22 @@ class GASNet(nn.Module):
         num_parts: int = 4,
         use_gem: bool = False,
         gem_p: float = 3.0,
+        backbone: str = "resnet50",
     ):
         super().__init__()
         if num_parts < 1:
             raise ValueError("num_parts must be >= 1")
         self.use_part_branch = use_part_branch
         self.num_parts = num_parts
-        weights = models.ResNet50_Weights.DEFAULT if use_pretrained else None
-        base = models.resnet50(weights=weights)
+        if backbone == "resnet50":
+            weights = models.ResNet50_Weights.DEFAULT if use_pretrained else None
+            base = models.resnet50(weights=weights)
+        elif backbone == "resnet50_ibn":
+            base = ResNetIBN()
+            if use_pretrained:
+                _load_matching_resnet50_weights(base)
+        else:
+            raise ValueError(f"Unsupported backbone: {backbone}")
         
         self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
         
@@ -896,6 +1008,7 @@ def main() -> None:
         num_parts=args.num_parts,
         use_gem=args.use_gem,
         gem_p=args.gem_p,
+        backbone=args.backbone,
     ).to(device)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -929,7 +1042,7 @@ def main() -> None:
         f"dataset={args.dataset}, camera_balanced={args.dataset == 'vrai' and not args.disable_camera_balanced_sampler}, "
         f"attr_hard_negative={args.dataset == 'vrai' and not args.disable_attribute_hard_negative_sampler}, "
         f"part_branch={args.use_part_branch}, attention_reg_weight={args.attention_reg_weight}, "
-        f"strong_aug={args.strong_aug}, pk_k={args.pk_k}, gem={args.use_gem}"
+        f"strong_aug={args.strong_aug}, pk_k={args.pk_k}, gem={args.use_gem}, backbone={args.backbone}"
     )
 
     model.train()
