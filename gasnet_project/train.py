@@ -157,6 +157,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-rerank", action="store_true", help="Apply lightweight re-ranking during VRU evaluation")
     parser.add_argument("--eval-rerank-k1", type=int, default=20)
     parser.add_argument("--eval-rerank-alpha", type=float, default=0.3)
+    parser.add_argument("--eval-tta-flip", action="store_true", help="Average original and horizontal-flip features during VRU evaluation")
+    parser.add_argument("--strong-aug", action="store_true", help="Use stronger domain-randomization augmentation for training")
+    parser.add_argument("--pk-k", type=int, default=4, help="Images per identity in PK sampler")
+    parser.add_argument("--use-gem", action="store_true", help="Use GeM pooling instead of average pooling")
+    parser.add_argument("--gem-p", type=float, default=3.0, help="GeM pooling exponent")
     parser.add_argument("--disable-camera-balanced-sampler", action="store_true")
     parser.add_argument("--disable-attribute-hard-negative-sampler", action="store_true")
     parser.add_argument("--use-part-branch", action="store_true", help="Enable unsupervised horizontal part feature branch")
@@ -413,6 +418,16 @@ class BNNeck(nn.Module):
         return self.bn(x)
 
 
+class GeMPool(nn.Module):
+    def __init__(self, p: float = 3.0, eps: float = 1e-6):
+        super().__init__()
+        self.p = float(p)
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.avg_pool2d(x.clamp(min=self.eps).pow(self.p), kernel_size=x.shape[-2:]).pow(1.0 / self.p)
+
+
 class GASNet(nn.Module):
     def __init__(
         self,
@@ -420,6 +435,8 @@ class GASNet(nn.Module):
         use_pretrained: bool = True,
         use_part_branch: bool = False,
         num_parts: int = 4,
+        use_gem: bool = False,
+        gem_p: float = 3.0,
     ):
         super().__init__()
         if num_parts < 1:
@@ -444,7 +461,7 @@ class GASNet(nn.Module):
         self.fs1 = OSBlockFS(1024, 512)
         self.fs2 = OSBlockFS(512, 512)
         
-        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.gap = GeMPool(p=gem_p) if use_gem else nn.AdaptiveAvgPool2d(1)
         self.bnneck_global = BNNeck(2048)
         self.bnneck_fs = BNNeck(512)
         if self.use_part_branch:
@@ -813,13 +830,31 @@ def main() -> None:
     train_label_map = {vid: i for i, vid in enumerate(train_ids)}
     num_classes = len(train_label_map)
 
-    train_tfms = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomCrop((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    if args.strong_aug:
+        train_tfms = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.RandomResizedCrop((224, 224), scale=(0.75, 1.0), ratio=(0.85, 1.15)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomApply([transforms.RandomRotation(degrees=12)], p=0.35),
+            transforms.RandomApply([transforms.RandomPerspective(distortion_scale=0.18, p=1.0)], p=0.25),
+            transforms.RandomApply(
+                [transforms.ColorJitter(brightness=0.25, contrast=0.25, saturation=0.20, hue=0.04)],
+                p=0.75,
+            ),
+            transforms.RandomGrayscale(p=0.08),
+            transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.2))], p=0.20),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.RandomErasing(p=0.25, scale=(0.02, 0.18), ratio=(0.3, 3.3), value="random"),
+        ])
+    else:
+        train_tfms = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomCrop((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
     test_tfms = transforms.Compose([
         transforms.Resize((256, 256)),
         transforms.CenterCrop((224, 224)),
@@ -827,7 +862,9 @@ def main() -> None:
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    pk_k = 4
+    pk_k = args.pk_k
+    if pk_k < 2:
+        raise ValueError("--pk-k must be >= 2")
     batch_size = args.batch_size
     if batch_size % pk_k != 0:
         raise ValueError(f"--batch-size must be divisible by k={pk_k}, got {batch_size}")
@@ -857,6 +894,8 @@ def main() -> None:
         use_pretrained=not args.no_pretrained,
         use_part_branch=args.use_part_branch,
         num_parts=args.num_parts,
+        use_gem=args.use_gem,
+        gem_p=args.gem_p,
     ).to(device)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -889,7 +928,8 @@ def main() -> None:
         f"workers={args.num_workers}, pin_memory={pin_memory}, persistent_workers={persistent_workers}, "
         f"dataset={args.dataset}, camera_balanced={args.dataset == 'vrai' and not args.disable_camera_balanced_sampler}, "
         f"attr_hard_negative={args.dataset == 'vrai' and not args.disable_attribute_hard_negative_sampler}, "
-        f"part_branch={args.use_part_branch}, attention_reg_weight={args.attention_reg_weight}"
+        f"part_branch={args.use_part_branch}, attention_reg_weight={args.attention_reg_weight}, "
+        f"strong_aug={args.strong_aug}, pk_k={args.pk_k}, gem={args.use_gem}"
     )
 
     model.train()
@@ -996,6 +1036,7 @@ def main() -> None:
                 rerank=args.eval_rerank,
                 rerank_k1=args.eval_rerank_k1,
                 rerank_alpha=args.eval_rerank_alpha,
+                tta_flip=args.eval_tta_flip,
             )
             print_eval_report(metrics, title=f"Evaluation @ Epoch {epoch}")
             if save_best:
@@ -1031,6 +1072,7 @@ def main() -> None:
             rerank=args.eval_rerank,
             rerank_k1=args.eval_rerank_k1,
             rerank_alpha=args.eval_rerank_alpha,
+            tta_flip=args.eval_tta_flip,
         )
         print_eval_report(metrics, title="Final Evaluation")
         if save_best:

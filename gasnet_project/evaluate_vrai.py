@@ -860,6 +860,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diagnostic-topk", type=int, default=20, help="Top-k used for no_match_in_topk diagnostics")
     parser.add_argument("--use-part-branch", action="store_true", help="Load/evaluate a checkpoint trained with the part branch")
     parser.add_argument("--num-parts", type=int, default=4, help="Number of horizontal stripes used by the part branch")
+    parser.add_argument("--use-gem", action="store_true", help="Load/evaluate a checkpoint trained with GeM pooling")
+    parser.add_argument("--gem-p", type=float, default=3.0, help="GeM pooling exponent")
+    parser.add_argument("--tta-flip", action="store_true", help="Average original and horizontal-flip features")
     parser.add_argument("--analyze-failures", action="store_true", help="Write detailed Rank-1 failure analysis for eval mode")
     parser.add_argument("--analysis-output-dir", type=Path, default=Path("output/vrai_failure_analysis"))
     parser.add_argument("--analysis-topk", type=int, default=20, help="Top-k retrievals kept per failure case")
@@ -976,6 +979,8 @@ def main() -> None:
         use_pretrained=False,
         use_part_branch=args.use_part_branch,
         num_parts=args.num_parts,
+        use_gem=args.use_gem,
+        gem_p=args.gem_p,
     ).to(device)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -1002,6 +1007,46 @@ def main() -> None:
         use_channels_last,
         args.log_every,
     ).to(device)
+    if args.tta_flip:
+        flip_tfms = transforms.Compose([test_tfms, transforms.RandomHorizontalFlip(p=1.0)])
+        q_flip_loader = _make_loader(
+            query_paths,
+            flip_tfms,
+            args.batch_size,
+            args.num_workers,
+            pin_memory,
+            persistent_workers,
+            args.prefetch_factor,
+        )
+        g_flip_loader = _make_loader(
+            gallery_paths,
+            flip_tfms,
+            args.batch_size,
+            args.num_workers,
+            pin_memory,
+            persistent_workers,
+            args.prefetch_factor,
+        )
+        q_flip_feat = _extract_features(
+            model,
+            q_flip_loader,
+            device,
+            use_amp,
+            amp_dtype,
+            use_channels_last,
+            args.log_every,
+        ).to(device)
+        g_flip_feat = _extract_features(
+            model,
+            g_flip_loader,
+            device,
+            use_amp,
+            amp_dtype,
+            use_channels_last,
+            args.log_every,
+        ).to(device)
+        q_feat = F.normalize(F.normalize(q_feat, dim=1) + F.normalize(q_flip_feat, dim=1), dim=1)
+        g_feat = F.normalize(F.normalize(g_feat, dim=1) + F.normalize(g_flip_feat, dim=1), dim=1)
 
     if args.mode == "eval":
         q_ids = torch.tensor(query_ids, dtype=torch.long, device=device)

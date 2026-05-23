@@ -147,6 +147,7 @@ def run_eval(
     rerank: bool = False,
     rerank_k1: int = 20,
     rerank_alpha: float = 0.3,
+    tta_flip: bool = False,
 ) -> Dict[str, Tuple[float, float, float]]:
     vru_dir = data_root / "VRU"
     pic_dir = vru_dir / "Pic"
@@ -199,6 +200,55 @@ def run_eval(
             use_channels_last,
             output_device=feat_out_device,
         )
+        if tta_flip:
+            flip_transform = test_transform
+            try:
+                from torchvision import transforms
+
+                flip_transform = transforms.Compose([
+                    test_transform,
+                    transforms.RandomHorizontalFlip(p=1.0),
+                ])
+            except Exception:
+                flip_transform = test_transform
+            q_flip_loader = _make_eval_loader(
+                query_samples,
+                flip_transform,
+                batch_size,
+                num_workers,
+                pin_memory,
+                persistent_workers,
+                prefetch_factor,
+            )
+            g_flip_loader = _make_eval_loader(
+                gallery_samples,
+                flip_transform,
+                batch_size,
+                num_workers,
+                pin_memory,
+                persistent_workers,
+                prefetch_factor,
+            )
+            q_flip_feat, _ = _extract_features(
+                model,
+                q_flip_loader,
+                device,
+                use_amp,
+                amp_dtype,
+                use_channels_last,
+                output_device=feat_out_device,
+            )
+            g_flip_feat, _ = _extract_features(
+                model,
+                g_flip_loader,
+                device,
+                use_amp,
+                amp_dtype,
+                use_channels_last,
+                output_device=feat_out_device,
+            )
+            q_feat = F.normalize(F.normalize(q_feat, dim=1) + F.normalize(q_flip_feat, dim=1), dim=1)
+            g_feat = F.normalize(F.normalize(g_feat, dim=1) + F.normalize(g_flip_feat, dim=1), dim=1)
         if rerank:
             q_feat, g_feat = _query_expansion_rerank_features(
                 q_feat=q_feat,
