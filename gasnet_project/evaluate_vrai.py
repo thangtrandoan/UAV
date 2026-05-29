@@ -343,6 +343,136 @@ def _human_obvious_hint(mismatches: List[str], same_camera: bool, q_parts: int, 
     return "ambiguous_needs_visual_check"
 
 
+def _build_case_from_order(
+    q_local: int,
+    order_row: torch.Tensor,
+    score_row: torch.Tensor,
+    query_ids: List[int],
+    gallery_ids: List[int],
+    query_idx: List[int],
+    gallery_idx: List[int],
+    image_names: List[str],
+    annotation: dict,
+    split: str,
+) -> dict:
+    q_name = image_names[query_idx[q_local]]
+    q_id = int(query_ids[q_local])
+    top_matches = []
+    first_correct_rank = None
+
+    for rank, (g_local_t, score_t) in enumerate(zip(order_row.tolist(), score_row.tolist()), 1):
+        g_local = int(g_local_t)
+        g_name = image_names[gallery_idx[g_local]]
+        g_id = int(gallery_ids[g_local])
+        is_correct = g_id == q_id
+        if is_correct and first_correct_rank is None:
+            first_correct_rank = rank
+        top_matches.append(
+            {
+                "rank": rank,
+                "gallery_index": int(gallery_idx[g_local]),
+                "name": g_name,
+                "id": g_id,
+                "camera": _parse_camera(g_name, split),
+                "score": float(score_t),
+                "is_correct": is_correct,
+            }
+        )
+
+    pred_gallery_local = int(order_row[0].item())
+    pred_name = image_names[gallery_idx[pred_gallery_local]]
+    pred_id = int(gallery_ids[pred_gallery_local])
+    q_attrs = _get_attrs(annotation, q_name, split)
+    pred_attrs = _get_attrs(annotation, pred_name, split)
+    mismatches = _attr_mismatches(q_attrs, pred_attrs) if pred_id != q_id else []
+    same_camera = _parse_camera(q_name, split) == _parse_camera(pred_name, split)
+    q_parts = len(annotation.get("d_part_label", {}).get(q_name, []))
+    pred_parts = len(annotation.get("d_part_label", {}).get(pred_name, []))
+    human_hint = "rank1_correct" if pred_id == q_id else _human_obvious_hint(mismatches, same_camera, q_parts, pred_parts)
+
+    return {
+        "query_local_index": q_local,
+        "query_index": int(query_idx[q_local]),
+        "query_name": q_name,
+        "query_id": q_id,
+        "query_camera": _parse_camera(q_name, split),
+        "query_frame": _parse_train_frame(q_name) if split == "train" else "",
+        "query_attrs": q_attrs,
+        "query_discriminative_parts": q_parts,
+        "rank1_gallery_index": int(gallery_idx[pred_gallery_local]),
+        "rank1_name": pred_name,
+        "rank1_id": pred_id,
+        "rank1_camera": _parse_camera(pred_name, split),
+        "rank1_frame": _parse_train_frame(pred_name) if split == "train" else "",
+        "rank1_attrs": pred_attrs,
+        "rank1_discriminative_parts": pred_parts,
+        "rank1_is_correct": pred_id == q_id,
+        "first_correct_rank": first_correct_rank,
+        "attribute_mismatches": mismatches,
+        "same_camera_as_rank1": same_camera,
+        "human_obvious_hint": human_hint,
+        "top_matches": top_matches,
+    }
+
+
+@torch.no_grad()
+def _collect_selected_query_cases(
+    q_feat: torch.Tensor,
+    g_feat: torch.Tensor,
+    query_indices: List[int],
+    query_ids: List[int],
+    gallery_ids: List[int],
+    query_idx: List[int],
+    gallery_idx: List[int],
+    image_names: List[str],
+    annotation: dict,
+    split: str,
+    topk: int,
+    use_fp16_sim: bool,
+) -> List[dict]:
+    q = F.normalize(q_feat.float(), dim=1)
+    g = F.normalize(g_feat.float(), dim=1)
+    index_to_local = {int(global_idx): local for local, global_idx in enumerate(query_idx)}
+    selected_local = []
+    for query_index in query_indices:
+        if int(query_index) not in index_to_local:
+            print(f"Warning: query_index {query_index} is not in the current query split; skipping")
+            continue
+        selected_local.append(index_to_local[int(query_index)])
+    if not selected_local:
+        return []
+
+    k = min(topk, g.size(0))
+    sim_dtype = None
+    if q.is_cuda and use_fp16_sim:
+        sim_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    g_mm = g.to(sim_dtype) if sim_dtype is not None else g
+
+    cases = []
+    for q_local in selected_local:
+        q_row = q[q_local : q_local + 1]
+        q_mm = q_row.to(sim_dtype) if sim_dtype is not None else q_row
+        sim = q_mm @ g_mm.t()
+        if sim_dtype is not None:
+            sim = sim.float()
+        scores, order = torch.topk(sim, k=k, dim=1, largest=True, sorted=True)
+        cases.append(
+            _build_case_from_order(
+                q_local=q_local,
+                order_row=order[0],
+                score_row=scores[0],
+                query_ids=query_ids,
+                gallery_ids=gallery_ids,
+                query_idx=query_idx,
+                gallery_idx=gallery_idx,
+                image_names=image_names,
+                annotation=annotation,
+                split=split,
+            )
+        )
+    return cases
+
+
 def _build_train_query_gallery(image_names: List[str]) -> Tuple[List[int], List[int], List[int], List[int]]:
     by_id: Dict[str, List[int]] = {}
     for idx, name in enumerate(image_names):
@@ -829,6 +959,79 @@ def _write_failure_analysis(
     print(f"Wrote failure analysis to {out_dir}")
 
 
+def _write_selected_query_analysis(
+    cases: List[dict],
+    images_dir: Path,
+    annotation: dict,
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+    device: torch.device,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    use_channels_last: bool,
+) -> None:
+    out_dir = args.selected_output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with (out_dir / "selected_cases.jsonl").open("w", encoding="utf-8") as f:
+        for case in cases:
+            f.write(json.dumps(case, ensure_ascii=False) + "\n")
+
+    for idx, case in enumerate(cases):
+        status = "correct" if case.get("rank1_is_correct") else "wrong"
+        case_dir = out_dir / f"selected_{idx:04d}_q{case['query_index']}_{status}_pred{case['rank1_gallery_index']}"
+        _save_contact_sheet(case, images_dir, case_dir / "top_matches.jpg", args.contact_sheet_topk)
+
+        heatmap_stats = {}
+        heatmap_stats["query"] = _save_attention_heatmaps(
+            model,
+            images_dir / case["query_name"],
+            case_dir / "query_heatmaps",
+            device,
+            use_amp,
+            amp_dtype,
+            use_channels_last,
+            args.heatmap_layers,
+        )
+        heatmap_stats["rank1_match"] = _save_attention_heatmaps(
+            model,
+            images_dir / case["rank1_name"],
+            case_dir / "rank1_heatmaps",
+            device,
+            use_amp,
+            amp_dtype,
+            use_channels_last,
+            args.heatmap_layers,
+        )
+
+        correct = next((m for m in case["top_matches"] if m["is_correct"]), None)
+        if correct is not None and correct["name"] != case["rank1_name"]:
+            heatmap_stats["first_correct_match"] = _save_attention_heatmaps(
+                model,
+                images_dir / correct["name"],
+                case_dir / "first_correct_heatmaps",
+                device,
+                use_amp,
+                amp_dtype,
+                use_channels_last,
+                args.heatmap_layers,
+            )
+
+        with (case_dir / "case.json").open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "case": case,
+                    "heatmap_stats": heatmap_stats,
+                    "d_part_label": annotation.get("d_part_label", {}).get(case["query_name"], []),
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+    print(f"Wrote selected query analysis to {out_dir}")
+
+
 def parse_args() -> argparse.Namespace:
     repo_root = Path(__file__).resolve().parents[1]
     vrai_dir = repo_root / "VRAI"
@@ -871,6 +1074,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heatmap-cases", type=int, default=12, help="Number of failure cases with saved attention heatmaps")
     parser.add_argument("--heatmap-layers", nargs="+", default=["ga1", "ga2", "ga3", "ga4"], choices=["ga1", "ga2", "ga3", "ga4"])
     parser.add_argument("--contact-sheet-topk", type=int, default=5, help="Top-k gallery images shown next to query")
+    parser.add_argument("--selected-query-indices", type=int, nargs="*", default=[], help="Global query indices to export, including corrected cases")
+    parser.add_argument("--selected-query-file", type=Path, default=None, help="Text file with one global query index per line")
+    parser.add_argument("--selected-output-dir", type=Path, default=Path("output/vrai_selected_query_analysis"))
     return parser.parse_args()
 
 
@@ -1156,6 +1362,44 @@ def main() -> None:
                 failures=failures,
                 summary=summary,
                 image_names=image_names,
+                images_dir=images_dir,
+                annotation=annotation,
+                model=model,
+                args=args,
+                device=device,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                use_channels_last=use_channels_last,
+            )
+
+        selected_query_indices = list(args.selected_query_indices)
+        if args.selected_query_file is not None:
+            with args.selected_query_file.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    selected_query_indices.append(int(line.split()[0]))
+        if selected_query_indices:
+            print("\n=== VRAI Selected Query Analysis ===")
+            selected_topk = max(args.analysis_topk, args.contact_sheet_topk, 20)
+            selected_cases = _collect_selected_query_cases(
+                q_feat=analysis_q_feat,
+                g_feat=analysis_g_feat,
+                query_indices=selected_query_indices,
+                query_ids=query_ids,
+                gallery_ids=gallery_ids,
+                query_idx=query_idx,
+                gallery_idx=gallery_idx,
+                image_names=image_names,
+                annotation=annotation,
+                split=args.split,
+                topk=selected_topk,
+                use_fp16_sim=(not args.no_fp16_sim),
+            )
+            print(f"Selected query cases: {len(selected_cases)}/{len(selected_query_indices)}")
+            _write_selected_query_analysis(
+                cases=selected_cases,
                 images_dir=images_dir,
                 annotation=annotation,
                 model=model,

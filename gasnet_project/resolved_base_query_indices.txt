@@ -1,0 +1,12 @@
+# Base failure cases that did not appear in vrai_failure_analysis_5/failure_cases.jsonl.
+# Use these to export visual examples from the best checkpoint.
+789
+1176
+1179
+1593
+1591
+1667
+1684
+1934
+1937
+1935
