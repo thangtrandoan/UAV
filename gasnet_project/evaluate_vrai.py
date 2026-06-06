@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import pickle
+import random
 from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -473,7 +474,10 @@ def _collect_selected_query_cases(
     return cases
 
 
-def _build_train_query_gallery(image_names: List[str]) -> Tuple[List[int], List[int], List[int], List[int]]:
+def _build_train_query_gallery(
+    image_names: List[str],
+    random_seed: int = 42,
+) -> Tuple[List[int], List[int], List[int], List[int]]:
     by_id: Dict[str, List[int]] = {}
     for idx, name in enumerate(image_names):
         id_str = _parse_train_id(name)
@@ -490,8 +494,10 @@ def _build_train_query_gallery(image_names: List[str]) -> Tuple[List[int], List[
         id_map[id_str] = next_id
         next_id += 1
         idxs_sorted = sorted(idxs, key=lambda i: image_names[i])
-        gallery_idx.append(idxs_sorted[0])
-        query_idx.extend(idxs_sorted[1:])
+        rng = random.Random(f"{random_seed}:{id_str}")
+        query_choice = rng.choice(idxs_sorted)
+        query_idx.append(query_choice)
+        gallery_idx.extend(i for i in idxs_sorted if i != query_choice)
 
     if not query_idx or not gallery_idx:
         raise ValueError("Not enough images per identity to build query/gallery for train split")
@@ -557,12 +563,16 @@ def _infer_eval_lists(
     split: str,
     annotation: dict,
     id_map_path: Path | None,
+    train_random_seed: int = 42,
 ) -> Tuple[List[str], List[int], List[int], List[int], List[int]]:
     if split == "train":
         image_names = annotation.get("train_im_names")
         if image_names is None:
             raise KeyError("train_im_names not found in train_annotation.pkl")
-        query_idx, gallery_idx, query_ids, gallery_ids = _build_train_query_gallery(image_names)
+        query_idx, gallery_idx, query_ids, gallery_ids = _build_train_query_gallery(
+            image_names,
+            random_seed=train_random_seed,
+        )
         return image_names, query_idx, gallery_idx, query_ids, gallery_ids
 
     image_names = annotation.get("test_im_names") or annotation.get("dev_im_names")
@@ -1042,6 +1052,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--annotation", type=Path, default=None)
     parser.add_argument("--images-dir", type=Path, default=None)
     parser.add_argument("--id-map", type=Path, default=None)
+    parser.add_argument(
+        "--train-random-seed",
+        type=int,
+        default=42,
+        help="Seed used to choose one random query image per ID for VRAI train eval",
+    )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=2)
@@ -1105,7 +1121,10 @@ def main() -> None:
     annotation = _load_annotation(annotation_path)
     if args.mode == "eval":
         image_names, query_idx, gallery_idx, query_ids, gallery_ids = _infer_eval_lists(
-            args.split, annotation, args.id_map
+            args.split,
+            annotation,
+            args.id_map,
+            train_random_seed=args.train_random_seed,
         )
     else:
         image_names = annotation.get("test_im_names") or annotation.get("dev_im_names")
