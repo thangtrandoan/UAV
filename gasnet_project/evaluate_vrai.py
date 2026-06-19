@@ -1079,6 +1079,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diagnostic-topk", type=int, default=20, help="Top-k used for no_match_in_topk diagnostics")
     parser.add_argument("--use-part-branch", action="store_true", help="Load/evaluate a checkpoint trained with the part branch")
     parser.add_argument("--num-parts", type=int, default=4, help="Number of horizontal stripes used by the part branch")
+    parser.add_argument("--use-attention-local", action="store_true", help="Load/evaluate a checkpoint trained with the attention local branch")
+    parser.add_argument("--num-attention-heads", type=int, default=4, help="Number of attention maps used by the local branch")
     parser.add_argument("--use-gem", action="store_true", help="Load/evaluate a checkpoint trained with GeM pooling")
     parser.add_argument("--gem-p", type=float, default=3.0, help="GeM pooling exponent")
     parser.add_argument("--backbone", choices=["resnet50", "resnet50_ibn"], default="resnet50")
@@ -1208,6 +1210,8 @@ def main() -> None:
         use_gem=args.use_gem,
         gem_p=args.gem_p,
         backbone=args.backbone,
+        use_attention_local=args.use_attention_local,
+        num_attention_heads=args.num_attention_heads,
     ).to(device)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)

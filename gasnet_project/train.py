@@ -170,6 +170,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attention-reg-weight", type=float, default=0.0, help="Weight for spatial attention regularization")
     parser.add_argument("--attention-target-mean", type=float, default=0.55, help="Target mean activation for spatial attention maps")
     parser.add_argument("--attention-std-margin", type=float, default=0.08, help="Minimum per-map std encouraged for attention maps")
+    parser.add_argument("--use-attention-local", action="store_true", help="Enable attention-guided local feature branch (replaces part branch)")
+    parser.add_argument("--num-attention-heads", type=int, default=4, help="Number of attention maps for local branch (1 or 4 for ablation)")
+    parser.add_argument("--attn-diversity-weight", type=float, default=0.0, help="Weight for diversity loss between attention heads (0=off)")
+    parser.add_argument("--attn-vis-dir", type=Path, default=None, help="Directory to save attention map visualizations")
     return parser.parse_args()
 
 
@@ -429,6 +433,56 @@ class GeMPool(nn.Module):
         return F.avg_pool2d(x.clamp(min=self.eps).pow(self.p), kernel_size=x.shape[-2:]).pow(1.0 / self.p)
 
 
+class AttentionLocalBranch(nn.Module):
+    """Attention-guided local feature learning for UAV Vehicle Re-ID.
+
+    Learns `num_heads` spatial attention maps that weight the backbone
+    feature map with residual attention ``x * (1 + att)``, producing
+    local features focusing on discriminative vehicle regions without
+    fixed horizontal partitioning.
+    """
+
+    def __init__(self, in_channels: int, num_heads: int = 4, reduction: int = 16):
+        super().__init__()
+        self.num_heads = num_heads
+        mid = max(1, in_channels // reduction)
+        self.attention = nn.Sequential(
+            nn.Conv2d(in_channels, mid, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, num_heads, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        # Keep gradient flow - no detach
+        self.last_attention: torch.Tensor | None = None
+
+    def forward(
+        self, feature_map: torch.Tensor, pool_fn: nn.Module
+    ) -> list[torch.Tensor]:
+        attention = self.attention(feature_map)      # [B, num_heads, H, W]
+        self.last_attention = attention               # gradient flows through
+
+        local_features = []
+        for i in range(self.num_heads):
+            att = attention[:, i : i + 1, :, :]      # [B, 1, H, W]
+            weighted = feature_map * (1 + att)        # residual attention
+            pooled = pool_fn(weighted).flatten(1)     # [B, 2048]
+            local_features.append(pooled)
+        return local_features
+
+    def diversity_loss(self) -> torch.Tensor:
+        """Orthogonality loss to encourage diverse attention maps."""
+        if self.last_attention is None:
+            return torch.tensor(0.0)
+        att = self.last_attention                     # [B, K, H, W]
+        B, K, H, W = att.shape
+        flat = att.view(B, K, -1)                     # [B, K, H*W]
+        flat = F.normalize(flat, dim=2)
+        gram = torch.bmm(flat, flat.transpose(1, 2))  # [B, K, K]
+        eye = torch.eye(K, device=gram.device).unsqueeze(0)
+        return ((gram - eye) ** 2).mean()
+
+
 class IBN(nn.Module):
     def __init__(self, channels: int, ratio: float = 0.5):
         super().__init__()
@@ -542,11 +596,14 @@ class GASNet(nn.Module):
         use_gem: bool = False,
         gem_p: float = 3.0,
         backbone: str = "resnet50",
+        use_attention_local: bool = False,
+        num_attention_heads: int = 4,
     ):
         super().__init__()
         if num_parts < 1:
             raise ValueError("num_parts must be >= 1")
         self.use_part_branch = use_part_branch
+        self.use_attention_local = use_attention_local
         self.num_parts = num_parts
         if backbone == "resnet50":
             weights = models.ResNet50_Weights.DEFAULT if use_pretrained else None
@@ -584,6 +641,26 @@ class GASNet(nn.Module):
             )
             self.bnneck_part = BNNeck(512)
             self.classifier_part = nn.Linear(512, num_classes, bias=False)
+        if self.use_attention_local:
+            self.attn_local = AttentionLocalBranch(
+                in_channels=2048,
+                num_heads=num_attention_heads,
+            )
+            # Per-head reduction: 2048 -> 256
+            self.attn_head_reduce = nn.ModuleList([
+                nn.Linear(2048, 256, bias=False)
+                for _ in range(num_attention_heads)
+            ])
+            # Concat reduction: 256*num_heads -> 512
+            self.attn_local_reduce = nn.Sequential(
+                nn.BatchNorm1d(256 * num_attention_heads),
+                nn.ReLU(inplace=True),
+                nn.Linear(256 * num_attention_heads, 512, bias=False),
+                nn.BatchNorm1d(512),
+                nn.ReLU(inplace=True),
+            )
+            self.bnneck_attn_local = BNNeck(512)
+            self.classifier_attn_local = nn.Linear(512, num_classes, bias=False)
         
         self.classifier_global = nn.Linear(2048, num_classes, bias=False)
         self.classifier_fs = nn.Linear(512, num_classes, bias=False)
@@ -634,15 +711,33 @@ class GASNet(nn.Module):
 
         logits_global = self.classifier_global(bn_global)
         logits_fs = self.classifier_fs(bn_fs)
-        if self.use_part_branch:
+
+        if self.use_attention_local:
+            local_feats = self.attn_local(x, self.gap)  # list of [B, 2048]
+            reduced = [
+                self.attn_head_reduce[i](feat)
+                for i, feat in enumerate(local_feats)
+            ]  # list of [B, 256]
+            attn_local_feat = self.attn_local_reduce(
+                torch.cat(reduced, dim=1)
+            )  # [B, 512]
+            bn_attn_local = self.bnneck_attn_local(attn_local_feat)
+            logits_attn_local = self.classifier_attn_local(bn_attn_local)
+
+        if self.use_part_branch and not self.use_attention_local:
             part_feat = self._part_pool(x)
             bn_part = self.bnneck_part(part_feat)
             logits_part = self.classifier_part(bn_part)
 
         if self.training:
+            if self.use_attention_local:
+                return (global_feat, fs_feat, attn_local_feat), (logits_global, logits_fs, logits_attn_local)
             if self.use_part_branch:
                 return (global_feat, fs_feat, part_feat), (logits_global, logits_fs, logits_part)
             return (global_feat, fs_feat), (logits_global, logits_fs)
+        
+        if self.use_attention_local:
+            return bn_global, bn_fs, bn_attn_local
         if self.use_part_branch:
             return bn_global, bn_fs, bn_part
         return bn_global, bn_fs
@@ -888,6 +983,93 @@ def _maybe_update_best_checkpoint(
     return best_score, None, None
 
 
+def _pick_vis_images(train_samples: List, max_images: int = 4) -> List[Path]:
+    """Select a few training images for attention visualization."""
+    ids_seen: set[int] = set()
+    selected: List[Path] = []
+    for s in train_samples:
+        if s.vehicle_id not in ids_seen:
+            ids_seen.add(s.vehicle_id)
+            selected.append(s.img_path)
+            if len(selected) >= max_images:
+                break
+    return selected
+
+
+@torch.no_grad()
+def _save_attention_local_visualization(
+    model: nn.Module,
+    sample_images: List[Path],
+    output_dir: Path,
+    epoch: int,
+    device: torch.device,
+    test_transform,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    use_channels_last: bool,
+) -> None:
+    """Save attention map overlays for a few sample images at given epoch."""
+    import numpy as np
+
+    base_model = getattr(model, "_orig_mod", model)
+    was_training = base_model.training
+    base_model.eval()
+
+    epoch_dir = output_dir / f"epoch_{epoch:03d}"
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+
+    for img_path in sample_images:
+        if not img_path.exists():
+            continue
+        with Image.open(img_path) as pil_img:
+            orig = pil_img.convert("RGB").resize((224, 224))
+
+        tensor = test_transform(Image.open(img_path).convert("RGB")).unsqueeze(0).to(device)
+        if use_channels_last:
+            tensor = tensor.to(memory_format=torch.channels_last)
+
+        autocast_kwargs = dict(device_type=device.type, enabled=(use_amp and device.type == "cuda"))
+        if device.type == "cuda":
+            autocast_kwargs["dtype"] = amp_dtype
+        with torch.autocast(**autocast_kwargs):
+            base_model(tensor)
+
+        att = base_model.attn_local.last_attention  # [1, K, H, W]
+        if att is None:
+            continue
+        att_np = att[0].float().cpu().numpy()  # [K, H, W]
+
+        orig_np = np.array(orig)  # [224, 224, 3]
+
+        for head_idx in range(att_np.shape[0]):
+            head_map = att_np[head_idx]  # [H, W]
+            low, high = head_map.min(), head_map.max()
+            if high - low > 1e-6:
+                head_map = (head_map - low) / (high - low)
+            else:
+                head_map = np.zeros_like(head_map)
+
+            # Resize to image size — simple nearest-neighbor via PIL
+            heat_gray = Image.fromarray((head_map * 255).astype(np.uint8))
+            heat_gray = heat_gray.resize((224, 224), Image.BILINEAR)
+            heat_arr = np.array(heat_gray).astype(np.float32) / 255.0  # [224, 224]
+
+            # Jet-like colormap: blue(0) -> green(0.5) -> red(1)
+            red = (255 * heat_arr).astype(np.uint8)
+            green = (255 * (1.0 - np.abs(heat_arr - 0.5) * 2.0)).astype(np.uint8)
+            blue = (255 * (1.0 - heat_arr)).astype(np.uint8)
+            heat_rgb = np.stack([red, green, blue], axis=-1)  # [224, 224, 3]
+
+            alpha = 0.4
+            overlay = (orig_np.astype(np.float32) * (1 - alpha) + heat_rgb.astype(np.float32) * alpha).astype(np.uint8)
+            Image.fromarray(overlay).save(epoch_dir / f"{img_path.stem}_head{head_idx}.jpg")
+
+    print(f"Saved attention visualization to {epoch_dir}")
+
+    if was_training:
+        base_model.train()
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -895,6 +1077,8 @@ def main() -> None:
 
     if args.grad_accum < 1:
         raise ValueError("--grad-accum must be >= 1")
+    if args.use_attention_local and args.use_part_branch:
+        raise ValueError("Cannot use both --use-attention-local and --use-part-branch; they are mutually exclusive")
     if args.eval_every > 0 and not args.run_eval:
         print("--eval-every was set, enabling --run-eval for VRU evaluation")
         args.run_eval = True
@@ -1009,6 +1193,8 @@ def main() -> None:
         use_gem=args.use_gem,
         gem_p=args.gem_p,
         backbone=args.backbone,
+        use_attention_local=args.use_attention_local,
+        num_attention_heads=args.num_attention_heads,
     ).to(device)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -1042,6 +1228,8 @@ def main() -> None:
         f"dataset={args.dataset}, camera_balanced={args.dataset == 'vrai' and not args.disable_camera_balanced_sampler}, "
         f"attr_hard_negative={args.dataset == 'vrai' and not args.disable_attribute_hard_negative_sampler}, "
         f"part_branch={args.use_part_branch}, attention_reg_weight={args.attention_reg_weight}, "
+        f"attn_local={args.use_attention_local}, attn_heads={args.num_attention_heads}, "
+        f"attn_diversity_weight={args.attn_diversity_weight}, "
         f"strong_aug={args.strong_aug}, pk_k={args.pk_k}, gem={args.use_gem}, backbone={args.backbone}"
     )
 
@@ -1096,6 +1284,10 @@ def main() -> None:
                         std_margin=args.attention_std_margin,
                     )
                     loss = loss + args.attention_reg_weight * loss_attn
+                if args.use_attention_local and args.attn_diversity_weight > 0:
+                    base_model = getattr(model, "_orig_mod", model)
+                    div_loss = base_model.attn_local.diversity_loss()
+                    loss = loss + args.attn_diversity_weight * div_loss
 
             loss_to_backprop = loss / args.grad_accum
             if use_amp and use_scaler:
@@ -1115,6 +1307,16 @@ def main() -> None:
 
             if step == 1 or step % args.log_every == 0 or step == len(train_loader):
                 print(f"  epoch {epoch} step {step}/{len(train_loader)} loss={loss.item():.4f}")
+                if args.use_attention_local and step == 1:
+                    base_model = getattr(model, "_orig_mod", model)
+                    att = base_model.attn_local.last_attention
+                    if att is not None:
+                        print(
+                            f"    attn_local: shape={tuple(att.shape)} "
+                            f"mean={att.mean().item():.4f} "
+                            f"min={att.min().item():.4f} "
+                            f"max={att.max().item():.4f}"
+                        )
 
         if step % args.grad_accum != 0:
             if use_amp and use_scaler:
@@ -1127,6 +1329,23 @@ def main() -> None:
         epoch_loss = running / len(train_loader.dataset)
         print(f"Epoch {epoch}: loss={epoch_loss:.4f}, time={(time.time() - t0)/60:.1f} min")
         scheduler.step()
+
+        if (
+            args.use_attention_local
+            and args.attn_vis_dir is not None
+            and epoch in (1, max(1, args.epochs // 2), args.epochs)
+        ):
+            _save_attention_local_visualization(
+                model=model,
+                sample_images=_pick_vis_images(train_samples, max_images=4),
+                output_dir=args.attn_vis_dir,
+                epoch=epoch,
+                device=device,
+                test_transform=test_tfms,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                use_channels_last=use_channels_last,
+            )
 
         should_eval_this_epoch = args.run_eval and args.eval_every > 0 and (epoch % args.eval_every == 0)
         if should_eval_this_epoch:
