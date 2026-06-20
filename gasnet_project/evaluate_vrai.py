@@ -507,6 +507,49 @@ def _build_train_query_gallery(
     return query_idx, gallery_idx, query_ids, gallery_ids
 
 
+def _build_train_query_gallery_centroid(
+    image_names: List[str],
+    features: torch.Tensor,
+) -> Tuple[List[int], List[int], List[int], List[int]]:
+    by_id: Dict[str, List[int]] = {}
+    for idx, name in enumerate(image_names):
+        id_str = _parse_train_id(name)
+        by_id.setdefault(id_str, []).append(idx)
+
+    query_idx: List[int] = []
+    gallery_idx: List[int] = []
+    id_map: Dict[str, int] = {}
+    next_id = 0
+
+    feat_norm = F.normalize(features.float(), dim=1)
+
+    for id_str, idxs in by_id.items():
+        if len(idxs) < 2:
+            continue
+        id_map[id_str] = next_id
+        next_id += 1
+
+        idxs_tensor = torch.tensor(idxs, dtype=torch.long, device=feat_norm.device)
+        id_feats = feat_norm[idxs_tensor]  # [N, D]
+        centroid = id_feats.mean(dim=0, keepdim=True)  # [1, D]
+        centroid = F.normalize(centroid, dim=1)
+
+        sims = (id_feats @ centroid.t()).squeeze(1)  # [N]
+        max_idx = torch.argmax(sims).item()
+
+        query_choice = idxs[max_idx]
+        query_idx.append(query_choice)
+        gallery_idx.extend(i for i in idxs if i != query_choice)
+
+    if not query_idx or not gallery_idx:
+        raise ValueError('Not enough images per identity to build query/gallery for train split')
+
+    query_ids = [id_map[_parse_train_id(image_names[i])] for i in query_idx]
+    gallery_ids = [id_map[_parse_train_id(image_names[i])] for i in gallery_idx]
+    return query_idx, gallery_idx, query_ids, gallery_ids
+
+
+
 def _make_loader(
     image_paths: List[Path],
     transform,
@@ -1058,6 +1101,12 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Seed used to choose one random query image per ID for VRAI train eval",
     )
+    parser.add_argument(
+        "--train-query-selection",
+        choices=["random", "centroid"],
+        default="random",
+        help="Query selection strategy for train split. 'random' picks one image randomly per ID. 'centroid' picks the image closest to the mean feature per ID.",
+    )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=2)
@@ -1121,30 +1170,39 @@ def main() -> None:
         images_dir = args.images_dir
 
     annotation = _load_annotation(annotation_path)
-    if args.mode == "eval":
-        image_names, query_idx, gallery_idx, query_ids, gallery_ids = _infer_eval_lists(
-            args.split,
-            annotation,
-            args.id_map,
-            train_random_seed=args.train_random_seed,
-        )
-    else:
-        image_names = annotation.get("test_im_names") or annotation.get("dev_im_names")
+    is_centroid = args.mode == "eval" and args.split == "train" and args.train_query_selection == "centroid"
+
+    if is_centroid:
+        image_names = annotation.get("train_im_names")
         if image_names is None:
-            raise KeyError("Annotation file missing test_im_names or dev_im_names")
-        query_idx = annotation["query_order"]
-        gallery_idx = annotation["gallery_order"]
-        if query_idx and isinstance(query_idx[0], str):
-            index_map = {name: i for i, name in enumerate(image_names)}
-            query_idx = [index_map[name] for name in query_idx]
-            gallery_idx = [index_map[name] for name in gallery_idx]
-    image_paths = [images_dir / name for name in image_names]
-
-    if not image_paths:
-        raise ValueError("No images found in annotation list")
-
-    query_paths = [image_paths[idx] for idx in query_idx]
-    gallery_paths = [image_paths[idx] for idx in gallery_idx]
+            raise KeyError("train_im_names not found in train_annotation.pkl")
+        image_paths = [images_dir / name for name in image_names]
+        query_paths = []
+        gallery_paths = []
+        query_idx, gallery_idx, query_ids, gallery_ids = [], [], [], []
+    else:
+        if args.mode == "eval":
+            image_names, query_idx, gallery_idx, query_ids, gallery_ids = _infer_eval_lists(
+                args.split,
+                annotation,
+                args.id_map,
+                train_random_seed=args.train_random_seed,
+            )
+        else:
+            image_names = annotation.get("test_im_names") or annotation.get("dev_im_names")
+            if image_names is None:
+                raise KeyError("Annotation file missing test_im_names or dev_im_names")
+            query_idx = annotation["query_order"]
+            gallery_idx = annotation["gallery_order"]
+            if query_idx and isinstance(query_idx[0], str):
+                index_map = {name: i for i, name in enumerate(image_names)}
+                query_idx = [index_map[name] for name in query_idx]
+                gallery_idx = [index_map[name] for name in gallery_idx]
+        image_paths = [images_dir / name for name in image_names]
+        if not image_paths:
+            raise ValueError("No images found in annotation list")
+        query_paths = [image_paths[idx] for idx in query_idx]
+        gallery_paths = [image_paths[idx] for idx in gallery_idx]
 
     if args.device:
         device = torch.device(args.device)
@@ -1176,25 +1234,6 @@ def main() -> None:
     pin_memory = torch.cuda.is_available() and (not args.no_pin_memory)
     persistent_workers = (not args.no_persistent_workers) and args.num_workers > 0
 
-    q_loader = _make_loader(
-        query_paths,
-        test_tfms,
-        args.batch_size,
-        args.num_workers,
-        pin_memory,
-        persistent_workers,
-        args.prefetch_factor,
-    )
-    g_loader = _make_loader(
-        gallery_paths,
-        test_tfms,
-        args.batch_size,
-        args.num_workers,
-        pin_memory,
-        persistent_workers,
-        args.prefetch_factor,
-    )
-
     state_dict = _normalize_state_dict(_load_checkpoint(args.model_path))
     try:
         num_classes = _infer_num_classes(state_dict)
@@ -1220,64 +1259,40 @@ def main() -> None:
     model.load_state_dict(filtered_state, strict=False)
     model.eval()
 
-    q_feat = _extract_features(
-        model,
-        q_loader,
-        device,
-        use_amp,
-        amp_dtype,
-        use_channels_last,
-        args.log_every,
-    ).to(device)
-    g_feat = _extract_features(
-        model,
-        g_loader,
-        device,
-        use_amp,
-        amp_dtype,
-        use_channels_last,
-        args.log_every,
-    ).to(device)
-    if args.tta_flip:
-        flip_tfms = transforms.Compose([test_tfms, transforms.RandomHorizontalFlip(p=1.0)])
-        q_flip_loader = _make_loader(
-            query_paths,
-            flip_tfms,
-            args.batch_size,
-            args.num_workers,
-            pin_memory,
-            persistent_workers,
-            args.prefetch_factor,
-        )
-        g_flip_loader = _make_loader(
-            gallery_paths,
-            flip_tfms,
-            args.batch_size,
-            args.num_workers,
-            pin_memory,
-            persistent_workers,
-            args.prefetch_factor,
-        )
-        q_flip_feat = _extract_features(
-            model,
-            q_flip_loader,
-            device,
-            use_amp,
-            amp_dtype,
-            use_channels_last,
-            args.log_every,
-        ).to(device)
-        g_flip_feat = _extract_features(
-            model,
-            g_flip_loader,
-            device,
-            use_amp,
-            amp_dtype,
-            use_channels_last,
-            args.log_every,
-        ).to(device)
-        q_feat = F.normalize(F.normalize(q_feat, dim=1) + F.normalize(q_flip_feat, dim=1), dim=1)
-        g_feat = F.normalize(F.normalize(g_feat, dim=1) + F.normalize(g_flip_feat, dim=1), dim=1)
+    if is_centroid:
+        print("Extracting features for all training images to select centroid queries...")
+        all_loader = _make_loader(image_paths, test_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor)
+        all_feat = _extract_features(model, all_loader, device, use_amp, amp_dtype, use_channels_last, args.log_every).to(device)
+        
+        if args.tta_flip:
+            flip_tfms = transforms.Compose([test_tfms, transforms.RandomHorizontalFlip(p=1.0)])
+            all_flip_loader = _make_loader(image_paths, flip_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor)
+            all_flip_feat = _extract_features(model, all_flip_loader, device, use_amp, amp_dtype, use_channels_last, args.log_every).to(device)
+            all_feat = F.normalize(F.normalize(all_feat, dim=1) + F.normalize(all_flip_feat, dim=1), dim=1)
+            
+        print("Building query/gallery splits based on feature centroids...")
+        query_idx, gallery_idx, query_ids, gallery_ids = _build_train_query_gallery_centroid(image_names, all_feat)
+        
+        q_feat = all_feat[query_idx]
+        g_feat = all_feat[gallery_idx]
+        
+    else:
+        q_loader = _make_loader(query_paths, test_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor)
+        g_loader = _make_loader(gallery_paths, test_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor)
+
+        q_feat = _extract_features(model, q_loader, device, use_amp, amp_dtype, use_channels_last, args.log_every).to(device)
+        g_feat = _extract_features(model, g_loader, device, use_amp, amp_dtype, use_channels_last, args.log_every).to(device)
+        
+        if args.tta_flip:
+            flip_tfms = transforms.Compose([test_tfms, transforms.RandomHorizontalFlip(p=1.0)])
+            q_flip_loader = _make_loader(query_paths, flip_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor)
+            g_flip_loader = _make_loader(gallery_paths, flip_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor)
+            
+            q_flip_feat = _extract_features(model, q_flip_loader, device, use_amp, amp_dtype, use_channels_last, args.log_every).to(device)
+            g_flip_feat = _extract_features(model, g_flip_loader, device, use_amp, amp_dtype, use_channels_last, args.log_every).to(device)
+            
+            q_feat = F.normalize(F.normalize(q_feat, dim=1) + F.normalize(q_flip_feat, dim=1), dim=1)
+            g_feat = F.normalize(F.normalize(g_feat, dim=1) + F.normalize(g_flip_feat, dim=1), dim=1)
 
     if args.mode == "eval":
         q_ids = torch.tensor(query_ids, dtype=torch.long, device=device)
