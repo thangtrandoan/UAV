@@ -34,7 +34,7 @@ _ = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
 print("Cached ResNet-50 weights")
 PY
 
-COPY train.py dataset.py utils.py evaluation.py ./
+COPY train.py dataset.py utils.py evaluation.py evaluate_vrai.py ./
 COPY entrypoint.sh /workspace/entrypoint.sh
 RUN chmod +x /workspace/entrypoint.sh
 
