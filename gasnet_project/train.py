@@ -180,7 +180,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pk-k", type=int, default=4, help="Images per identity in PK sampler")
     parser.add_argument("--use-gem", action="store_true", help="Use GeM pooling instead of average pooling")
     parser.add_argument("--gem-p", type=float, default=3.0, help="GeM pooling exponent")
-    parser.add_argument("--backbone", choices=["resnet50", "resnet50_ibn"], default="resnet50")
+    parser.add_argument("--backbone", choices=["resnet50", "resnet50_ibn", "swin_t"], default="resnet50")
     parser.add_argument("--disable-camera-balanced-sampler", action="store_true")
     parser.add_argument("--disable-attribute-hard-negative-sampler", action="store_true")
     parser.add_argument("--use-part-branch", action="store_true", help="Enable unsupervised horizontal part feature branch")
@@ -604,6 +604,71 @@ def _load_matching_resnet50_weights(model: nn.Module) -> None:
     print(f"Loaded {len(filtered)} matching ResNet50 weights into ResNet50-IBN; skipped {missing} tensors")
 
 
+class SwinBackbone(nn.Module):
+    """Swin-T backbone with 1x1 Conv channel adapters for GASNet compatibility.
+
+    Extracts hierarchical features from 4 Swin stages and projects channels
+    to match ResNet50 dimensions (256, 512, 1024, 2048) so that the
+    downstream FS branch, Attention Local Branch, and classifiers
+    work without modification.
+    """
+
+    # Swin-T channel sizes per stage
+    SWIN_CHANNELS = (96, 192, 384, 768)
+    # Target ResNet-equivalent channel sizes
+    TARGET_CHANNELS = (256, 512, 1024, 2048)
+
+    def __init__(self, pretrained: bool = True):
+        super().__init__()
+        from torchvision.models import swin_t, Swin_T_Weights
+
+        weights = Swin_T_Weights.DEFAULT if pretrained else None
+        base = swin_t(weights=weights)
+        if pretrained:
+            print("Loaded Swin-T pretrained weights")
+
+        # Split features into 4 stages.
+        # features layout: [patch_embed, stage1_blocks, patch_merge1,
+        #   stage2_blocks, patch_merge2, stage3_blocks, patch_merge3,
+        #   stage4_blocks]
+        self.stage1 = base.features[0:2]   # 96ch,  56x56
+        self.stage2 = base.features[2:4]   # 192ch, 28x28
+        self.stage3 = base.features[4:6]   # 384ch, 14x14
+        self.stage4 = base.features[6:8]   # 768ch, 7x7
+        self.norm = base.norm              # LayerNorm(768)
+
+        # 1x1 Conv adapters: Swin channels -> ResNet channels
+        adapters = []
+        for src_ch, tgt_ch in zip(self.SWIN_CHANNELS, self.TARGET_CHANNELS):
+            adapters.append(
+                nn.Sequential(
+                    nn.Conv2d(src_ch, tgt_ch, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(tgt_ch),
+                    nn.ReLU(inplace=True),
+                )
+            )
+        self.adapt1, self.adapt2, self.adapt3, self.adapt4 = adapters
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Swin stages output [B, H, W, C]; permute to [B, C, H, W] for Conv2d.
+        x = self.stage1(x)
+        feat1 = self.adapt1(x.permute(0, 3, 1, 2).contiguous())
+
+        x = self.stage2(x)
+        feat2 = self.adapt2(x.permute(0, 3, 1, 2).contiguous())
+
+        x = self.stage3(x)
+        feat3 = self.adapt3(x.permute(0, 3, 1, 2).contiguous())
+
+        x = self.stage4(x)
+        x = self.norm(x)  # final LayerNorm before last adapter
+        feat4 = self.adapt4(x.permute(0, 3, 1, 2).contiguous())
+
+        return feat1, feat2, feat3, feat4
+
+
 class GASNet(nn.Module):
     def __init__(
         self,
@@ -623,7 +688,10 @@ class GASNet(nn.Module):
         self.use_part_branch = use_part_branch
         self.use_attention_local = use_attention_local
         self.num_parts = num_parts
-        if backbone == "resnet50":
+        self.backbone_type = backbone
+        if backbone == "swin_t":
+            self.swin_backbone = SwinBackbone(pretrained=use_pretrained)
+        elif backbone == "resnet50":
             weights = models.ResNet50_Weights.DEFAULT if use_pretrained else None
             base = models.resnet50(weights=weights)
         elif backbone == "resnet50_ibn":
@@ -633,17 +701,16 @@ class GASNet(nn.Module):
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
         
-        self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
-        
-        self.layer1 = base.layer1
-        self.layer2 = base.layer2
-        self.layer3 = base.layer3
-        self.layer4 = base.layer4
-        
-        self.ga1 = RGABlock(256, spatial_size=(56, 56))
-        self.ga2 = RGABlock(512, spatial_size=(28, 28))
-        self.ga3 = RGABlock(1024, spatial_size=(14, 14))
-        self.ga4 = RGABlock(2048, spatial_size=(7, 7))
+        if backbone != "swin_t":
+            self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
+            self.layer1 = base.layer1
+            self.layer2 = base.layer2
+            self.layer3 = base.layer3
+            self.layer4 = base.layer4
+            self.ga1 = RGABlock(256, spatial_size=(56, 56))
+            self.ga2 = RGABlock(512, spatial_size=(28, 28))
+            self.ga3 = RGABlock(1024, spatial_size=(14, 14))
+            self.ga4 = RGABlock(2048, spatial_size=(7, 7))
         
         self.fs1 = OSBlockFS(1024, 512)
         self.fs2 = OSBlockFS(512, 512)
@@ -693,6 +760,9 @@ class GASNet(nn.Module):
         target_mean: float = 0.55,
         std_margin: float = 0.08,
     ) -> torch.Tensor:
+        # Swin backbone does not use RGA blocks (has built-in self-attention)
+        if self.backbone_type == "swin_t":
+            return next(self.parameters()).sum() * 0.0
         losses = []
         for block in (self.ga1, self.ga2, self.ga3, self.ga4):
             attn = block.rga_s.last_attention
@@ -707,20 +777,27 @@ class GASNet(nn.Module):
         return torch.stack(losses).mean()
 
     def forward(self, x: torch.Tensor):
-        x = self.stem(x)
-        x = self.layer1(x)
-        x = self.ga1(x)
+        if self.backbone_type == "swin_t":
+            feat1, feat2, feat3, feat4 = self.swin_backbone(x)
+            # Swin already has self-attention; skip RGA blocks
+            fs = self.fs1(feat3)
+            fs = self.fs2(fs)
+            x = feat4
+        else:
+            x = self.stem(x)
+            x = self.layer1(x)
+            x = self.ga1(x)
 
-        x = self.layer2(x)
-        x = self.ga2(x)
+            x = self.layer2(x)
+            x = self.ga2(x)
 
-        x = self.layer3(x)
-        fs = self.fs1(x)
-        fs = self.fs2(fs)
-        x = self.ga3(x)
+            x = self.layer3(x)
+            fs = self.fs1(x)
+            fs = self.fs2(fs)
+            x = self.ga3(x)
 
-        x = self.layer4(x)
-        x = self.ga4(x)
+            x = self.layer4(x)
+            x = self.ga4(x)
 
         global_feat = self.gap(x).flatten(1)
         fs_feat = self.gap(fs).flatten(1)

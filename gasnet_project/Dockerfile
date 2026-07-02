@@ -32,6 +32,9 @@ from torchvision import models
 
 _ = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
 print("Cached ResNet-50 weights")
+
+_ = models.swin_t(weights=models.Swin_T_Weights.DEFAULT)
+print("Cached Swin-T weights")
 PY
 
 COPY train.py dataset.py utils.py evaluation.py evaluate_vrai.py ./
