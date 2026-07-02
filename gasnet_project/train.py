@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import pickle
 import random
 import time
@@ -119,6 +120,22 @@ def _concat_relation(relation: torch.Tensor) -> torch.Tensor:
     return torch.cat([relation, relation.transpose(1, 2)], dim=1)
 
 
+
+class Logger(object):
+    def __init__(self, filename, stream):
+        self.stream = stream
+        self.log = open(filename, "a", encoding="utf-8")
+
+    def write(self, message):
+        self.stream.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.stream.flush()
+        self.log.flush()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train GASNet on VRU")
     parser.add_argument("--data-root", type=Path, required=True, help="Path containing VRU folder")
@@ -133,6 +150,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-pin-memory", action="store_true")
     parser.add_argument("--no-persistent-workers", action="store_true")
     parser.add_argument("--save-path", type=Path, default=Path("/workspace/output/gasnet_vru.pth"))
+    parser.add_argument("--log-path", type=Path, default=None, help="Path to save log text file")
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-eval", action="store_true", help="Run retrieval evaluation on Small/Medium/Big test splits")
@@ -1072,6 +1090,11 @@ def _save_attention_local_visualization(
 
 def main() -> None:
     args = parse_args()
+    if args.log_path:
+        args.log_path.parent.mkdir(parents=True, exist_ok=True)
+        sys.stdout = Logger(args.log_path, sys.stdout)
+        sys.stderr = Logger(args.log_path, sys.stderr)
+
     set_seed(args.seed)
     configure_cuda_for_speed()
 

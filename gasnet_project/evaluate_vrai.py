@@ -16,7 +16,8 @@ from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-from train import GASNet
+import sys
+from train import GASNet, Logger
 from utils import choose_amp_dtype, configure_cuda_for_speed, evaluate_map_cmc
 
 
@@ -1144,11 +1145,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--selected-query-indices", type=int, nargs="*", default=[], help="Global query indices to export, including corrected cases")
     parser.add_argument("--selected-query-file", type=Path, default=None, help="Text file with one global query index per line")
     parser.add_argument("--selected-output-dir", type=Path, default=Path("output/vrai_selected_query_analysis"))
+    parser.add_argument("--log-path", type=Path, default=None, help="Path to save log text file")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.log_path:
+        args.log_path.parent.mkdir(parents=True, exist_ok=True)
+        sys.stdout = Logger(args.log_path, sys.stdout)
+        sys.stderr = Logger(args.log_path, sys.stderr)
+
     configure_cuda_for_speed()
 
     if args.annotation is None:
