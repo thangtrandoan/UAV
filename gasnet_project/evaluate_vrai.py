@@ -813,12 +813,26 @@ def _collect_failure_cases(
     return failures, summary
 
 
-def _prepare_display_image(path: Path, size: int = 224) -> Image.Image:
+def _prepare_display_image(path: Path, size: int = 224, d_parts: list = None) -> Image.Image:
     with Image.open(path) as img:
-        img = img.convert("RGB").resize((256, 256), Image.BILINEAR)
-    left = (img.width - size) // 2
-    top = (img.height - size) // 2
-    return img.crop((left, top, left + size, top + size)).convert("RGB")
+        img_rgb = img.convert("RGB")
+        orig_w, orig_h = img_rgb.size
+        img_resized = img_rgb.resize((256, 256), Image.BILINEAR)
+        
+        if d_parts:
+            draw = ImageDraw.Draw(img_resized)
+            for part in d_parts:
+                if len(part) == 2 and len(part[0]) == 2 and len(part[1]) == 2:
+                    (x1, y1), (x2, y2) = part
+                    x1_s = int(x1 * 256 / orig_w)
+                    y1_s = int(y1 * 256 / orig_h)
+                    x2_s = int(x2 * 256 / orig_w)
+                    y2_s = int(y2 * 256 / orig_h)
+                    draw.rectangle([x1_s, y1_s, x2_s, y2_s], outline=(255, 255, 0), width=2)
+                    
+    left = (img_resized.width - size) // 2
+    top = (img_resized.height - size) // 2
+    return img_resized.crop((left, top, left + size, top + size)).convert("RGB")
 
 
 def _draw_label(draw: ImageDraw.ImageDraw, xy: Tuple[int, int], text: str, fill: Tuple[int, int, int]) -> None:
@@ -829,15 +843,20 @@ def _draw_label(draw: ImageDraw.ImageDraw, xy: Tuple[int, int], text: str, fill:
     draw.text(xy, text, fill=fill, font=font)
 
 
-def _save_contact_sheet(case: dict, images_dir: Path, out_path: Path, topk: int) -> None:
+def _save_contact_sheet(case: dict, images_dir: Path, out_path: Path, topk: int, annotation: dict = None) -> None:
     tiles = []
-    q_img = _prepare_display_image(images_dir / case["query_name"])
+    
+    q_name = case["query_name"]
+    q_parts = annotation.get("d_part_label", {}).get(q_name, []) if annotation else []
+    q_img = _prepare_display_image(images_dir / q_name, d_parts=q_parts)
     q_draw = ImageDraw.Draw(q_img)
     _draw_label(q_draw, (6, 6), f"Q id={case['query_id']} cam={case['query_camera']}", (255, 255, 255))
     tiles.append(q_img)
 
     for match in case["top_matches"][:topk]:
-        img = _prepare_display_image(images_dir / match["name"])
+        m_name = match["name"]
+        m_parts = annotation.get("d_part_label", {}).get(m_name, []) if annotation else []
+        img = _prepare_display_image(images_dir / m_name, d_parts=m_parts)
         draw = ImageDraw.Draw(img)
         fill = (80, 220, 120) if match["is_correct"] else (255, 90, 90)
         _draw_label(draw, (6, 6), f"R{match['rank']} id={match['id']} {match['score']:.3f}", fill)
@@ -983,13 +1002,13 @@ def _write_failure_analysis(
     for idx, case in enumerate(failures):
         # Đặt tên file có chứa ID và gợi ý lỗi để dễ dàng xem qua
         filename = f"case_{idx:04d}_q{case['query_id']}_hint_{case.get('human_obvious_hint', 'none')}.jpg"
-        _save_contact_sheet(case, images_dir, all_top5_dir / filename, args.contact_sheet_topk)
+        _save_contact_sheet(case, images_dir, all_top5_dir / filename, args.contact_sheet_topk, annotation=annotation)
     print("[INFO] Đã lưu xong tất cả ảnh top 5.")
     # =================================================================
 
     for idx, case in enumerate(selected[: args.heatmap_cases]):
         case_dir = out_dir / f"case_{idx:04d}_q{case['query_index']}_pred{case['rank1_gallery_index']}"
-        _save_contact_sheet(case, images_dir, case_dir / "top_matches.jpg", args.contact_sheet_topk)
+        _save_contact_sheet(case, images_dir, case_dir / "top_matches.jpg", args.contact_sheet_topk, annotation=annotation)
         heatmap_stats = {}
         q_stats = _save_attention_heatmaps(
             model,
@@ -1055,7 +1074,7 @@ def _write_selected_query_analysis(
     for idx, case in enumerate(cases):
         status = "correct" if case.get("rank1_is_correct") else "wrong"
         case_dir = out_dir / f"selected_{idx:04d}_q{case['query_index']}_{status}_pred{case['rank1_gallery_index']}"
-        _save_contact_sheet(case, images_dir, case_dir / "top_matches.jpg", args.contact_sheet_topk)
+        _save_contact_sheet(case, images_dir, case_dir / "top_matches.jpg", args.contact_sheet_topk, annotation=annotation)
 
         heatmap_stats = {}
         heatmap_stats["query"] = _save_attention_heatmaps(
