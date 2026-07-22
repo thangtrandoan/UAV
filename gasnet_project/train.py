@@ -448,7 +448,7 @@ class GeMPool(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.avg_pool2d(x.clamp(min=self.eps).pow(self.p), kernel_size=x.shape[-2:]).pow(1.0 / self.p)
+        return F.adaptive_avg_pool2d(x.clamp(min=self.eps).pow(self.p), (1, 1)).pow(1.0 / self.p)
 
 
 class AttentionLocalBranch(nn.Module):
@@ -506,7 +506,7 @@ class IBN(nn.Module):
         super().__init__()
         split = int(channels * ratio)
         self.split = split
-        self.in_norm = nn.InstanceNorm2d(split, affine=True)
+        self.in_norm = nn.GroupNorm(split, split, affine=True) # Dùng GroupNorm thay cho InstanceNorm để tránh lỗi ONNX
         self.bn_norm = nn.BatchNorm2d(channels - split)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -573,7 +573,7 @@ class ResNetIBN(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Conv2d):
                 nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(module, (nn.BatchNorm2d, nn.InstanceNorm2d)):
+            elif isinstance(module, (nn.BatchNorm2d, nn.InstanceNorm2d, nn.GroupNorm)):
                 if module.weight is not None:
                     nn.init.constant_(module.weight, 1)
                 if module.bias is not None:

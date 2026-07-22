@@ -45,10 +45,11 @@ ATTRIBUTE_KEYS = ("color_label", "type_label", "bumper_label", "wheel_label", "s
 
 
 class VRAIDataset(Dataset):
-    def __init__(self, image_paths: List[Path], transform=None, max_retries: int = 3):
+    def __init__(self, image_paths: List[Path], transform=None, max_retries: int = 3, use_cv2: bool = False):
         self.image_paths = image_paths
         self.transform = transform
         self.max_retries = max_retries
+        self.use_cv2 = use_cv2
 
     def __len__(self) -> int:
         return len(self.image_paths)
@@ -57,8 +58,16 @@ class VRAIDataset(Dataset):
         last_err = None
         for _ in range(self.max_retries):
             try:
-                with Image.open(path) as img:
-                    return img.convert("RGB")
+                if self.use_cv2:
+                    import cv2
+                    img = cv2.imread(str(path))
+                    if img is None:
+                        raise OSError(f"Cannot read image with cv2: {path}")
+                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    return Image.fromarray(img_rgb)
+                else:
+                    with Image.open(path) as img:
+                        return img.convert("RGB")
             except OSError as exc:
                 last_err = exc
         raise last_err
@@ -559,8 +568,9 @@ def _make_loader(
     pin_memory: bool,
     persistent_workers: bool,
     prefetch_factor: int,
+    use_cv2: bool = False,
 ) -> DataLoader:
-    ds = VRAIDataset(image_paths=image_paths, transform=transform, max_retries=3)
+    ds = VRAIDataset(image_paths=image_paths, transform=transform, max_retries=3, use_cv2=use_cv2)
     loader_kwargs = dict(pin_memory=pin_memory, drop_last=False)
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = persistent_workers
@@ -966,6 +976,17 @@ def _write_failure_analysis(
     with (out_dir / "failure_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
+    # === NEW BLOCK: Lưu contact sheet top 5 của TOÀN BỘ các ca lỗi ===
+    all_top5_dir = out_dir / "all_top5_failures"
+    all_top5_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\n[INFO] Đang lưu {len(failures)} ảnh top 5 của tất cả ca lỗi vào thư mục: {all_top5_dir} ...")
+    for idx, case in enumerate(failures):
+        # Đặt tên file có chứa ID và gợi ý lỗi để dễ dàng xem qua
+        filename = f"case_{idx:04d}_q{case['query_id']}_hint_{case.get('human_obvious_hint', 'none')}.jpg"
+        _save_contact_sheet(case, images_dir, all_top5_dir / filename, args.contact_sheet_topk)
+    print("[INFO] Đã lưu xong tất cả ảnh top 5.")
+    # =================================================================
+
     for idx, case in enumerate(selected[: args.heatmap_cases]):
         case_dir = out_dir / f"case_{idx:04d}_q{case['query_index']}_pred{case['rank1_gallery_index']}"
         _save_contact_sheet(case, images_dir, case_dir / "top_matches.jpg", args.contact_sheet_topk)
@@ -1146,11 +1167,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--selected-query-file", type=Path, default=None, help="Text file with one global query index per line")
     parser.add_argument("--selected-output-dir", type=Path, default=Path("output/vrai_selected_query_analysis"))
     parser.add_argument("--log-path", type=Path, default=None, help="Path to save log text file")
+    parser.add_argument("--gpu-jetson", action="store_true", help="Optimize dataloader and config for Jetson AGX Orin")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    
+    if args.gpu_jetson:
+        print("\n--- Jetson AGX Orin Optimization Enabled ---")
+        if args.batch_size == 256:
+            args.batch_size = 64
+        if args.num_workers == 4:
+            args.num_workers = 8
+        if args.prefetch_factor == 2:
+            args.prefetch_factor = 4
+            
     if args.log_path:
         args.log_path.parent.mkdir(parents=True, exist_ok=True)
         sys.stdout = Logger(args.log_path, sys.stdout)
@@ -1268,12 +1300,12 @@ def main() -> None:
 
     if is_centroid:
         print("Extracting features for all training images to select centroid queries...")
-        all_loader = _make_loader(image_paths, test_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor)
+        all_loader = _make_loader(image_paths, test_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor, args.gpu_jetson)
         all_feat = _extract_features(model, all_loader, device, use_amp, amp_dtype, use_channels_last, args.log_every).to(device)
         
         if args.tta_flip:
             flip_tfms = transforms.Compose([test_tfms, transforms.RandomHorizontalFlip(p=1.0)])
-            all_flip_loader = _make_loader(image_paths, flip_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor)
+            all_flip_loader = _make_loader(image_paths, flip_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor, args.gpu_jetson)
             all_flip_feat = _extract_features(model, all_flip_loader, device, use_amp, amp_dtype, use_channels_last, args.log_every).to(device)
             all_feat = F.normalize(F.normalize(all_feat, dim=1) + F.normalize(all_flip_feat, dim=1), dim=1)
             
@@ -1284,16 +1316,16 @@ def main() -> None:
         g_feat = all_feat[gallery_idx]
         
     else:
-        q_loader = _make_loader(query_paths, test_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor)
-        g_loader = _make_loader(gallery_paths, test_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor)
+        q_loader = _make_loader(query_paths, test_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor, args.gpu_jetson)
+        g_loader = _make_loader(gallery_paths, test_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor, args.gpu_jetson)
 
         q_feat = _extract_features(model, q_loader, device, use_amp, amp_dtype, use_channels_last, args.log_every).to(device)
         g_feat = _extract_features(model, g_loader, device, use_amp, amp_dtype, use_channels_last, args.log_every).to(device)
         
         if args.tta_flip:
             flip_tfms = transforms.Compose([test_tfms, transforms.RandomHorizontalFlip(p=1.0)])
-            q_flip_loader = _make_loader(query_paths, flip_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor)
-            g_flip_loader = _make_loader(gallery_paths, flip_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor)
+            q_flip_loader = _make_loader(query_paths, flip_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor, args.gpu_jetson)
+            g_flip_loader = _make_loader(gallery_paths, flip_tfms, args.batch_size, args.num_workers, pin_memory, persistent_workers, args.prefetch_factor, args.gpu_jetson)
             
             q_flip_feat = _extract_features(model, q_flip_loader, device, use_amp, amp_dtype, use_channels_last, args.log_every).to(device)
             g_flip_feat = _extract_features(model, g_flip_loader, device, use_amp, amp_dtype, use_channels_last, args.log_every).to(device)
