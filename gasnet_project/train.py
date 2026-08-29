@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import pickle
 import random
 import time
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -180,7 +182,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pk-k", type=int, default=4, help="Images per identity in PK sampler")
     parser.add_argument("--use-gem", action="store_true", help="Use GeM pooling instead of average pooling")
     parser.add_argument("--gem-p", type=float, default=3.0, help="GeM pooling exponent")
-    parser.add_argument("--backbone", choices=["resnet50", "resnet50_ibn", "swin_t"], default="resnet50")
+    parser.add_argument("--backbone", choices=[
+        "resnet50", "resnet50_ibn", "swin_t", "dinov3_convnext"
+    ], default="resnet50")
+    parser.add_argument("--backbone-lr", type=float, default=3e-5,
+                        help="Learning rate for ConvNeXt backbone (discriminative LR)")
+    parser.add_argument("--head-lr", type=float, default=3e-4,
+                        help="Learning rate for head/classifier (discriminative LR)")
+    parser.add_argument("--convnext-weight-decay", type=float, default=0.05,
+                        help="Weight decay for AdamW when using ConvNeXt backbone")
+    parser.add_argument("--convnext-warmup-epochs", type=int, default=10,
+                        help="Number of warmup epochs for ConvNeXt training")
     parser.add_argument("--disable-camera-balanced-sampler", action="store_true")
     parser.add_argument("--disable-attribute-hard-negative-sampler", action="store_true")
     parser.add_argument("--use-part-branch", action="store_true", help="Enable unsupervised horizontal part feature branch")
@@ -669,6 +681,70 @@ class SwinBackbone(nn.Module):
         return feat1, feat2, feat3, feat4
 
 
+class DINOv3ConvNeXtBackbone(nn.Module):
+    """DINOv3 ConvNeXt-Small (LVD-1689M) via HuggingFace.
+
+    Splits the HuggingFace model into individual stages so GASNet can
+    interleave RGA blocks between them — identical flow to ResNet.
+
+    HuggingFace ConvNeXt structure:
+        embeddings (patch_embed + layernorm) → encoder.stages[0-3]
+
+    After splitting:
+        self.stem   = embeddings          [3, 224, 224] → [96, 56, 56]
+        self.stage1 = encoder.stages[0]   [96, 56, 56]  → [96, 56, 56]
+        self.stage2 = encoder.stages[1]   [96, 56, 56]  → [192, 28, 28]
+        self.stage3 = encoder.stages[2]   [192, 28, 28] → [384, 14, 14]
+        self.stage4 = encoder.stages[3]   [384, 14, 14] → [768, 7, 7]
+
+    Native channel dims: (96, 192, 384, 768)
+    """
+
+    def __init__(self, pretrained: bool = True):
+        super().__init__()
+        from transformers import AutoModel, AutoConfig
+        from huggingface_hub import get_token
+        import transformers
+        from packaging import version
+
+        model_name = "facebook/dinov3-convnext-small-pretrain-lvd1689m"
+
+        # Auth token handling for gated models
+        kwargs = {}
+        hf_token = get_token() or os.environ.get("HF_TOKEN")
+        if version.parse(transformers.__version__) >= version.parse("4.32.0"):
+            kwargs["token"] = hf_token
+        else:
+            kwargs["use_auth_token"] = hf_token
+
+        if pretrained:
+            print(f"Loading pretrained ConvNeXt from HuggingFace: {model_name}...")
+            full_model = AutoModel.from_pretrained(model_name, **kwargs)
+        else:
+            config = AutoConfig.from_pretrained(model_name, **kwargs)
+            full_model = AutoModel.from_config(config)
+
+        # Split model into individual stages for sequential execution
+        if hasattr(full_model, "embeddings"):
+            # Standard HuggingFace ConvNeXt layout
+            self.stem = full_model.embeddings
+            self.stage1 = full_model.encoder.stages[0]
+            self.stage2 = full_model.encoder.stages[1]
+            self.stage3 = full_model.encoder.stages[2]
+            self.stage4 = full_model.encoder.stages[3]
+        else:
+            # DINOv3 ConvNeXt: embeddings folded into stage 0
+            self.stem = nn.Identity()
+            self.stage1 = full_model.model.stages[0]
+            self.stage2 = full_model.model.stages[1]
+            self.stage3 = full_model.model.stages[2]
+            self.stage4 = full_model.model.stages[3]
+
+        # Release reference to full model (sub-modules already moved to self.*)
+        del full_model
+        print("  DINOv3 ConvNeXt-Small backbone ready")
+
+
 class GASNet(nn.Module):
     def __init__(
         self,
@@ -689,8 +765,12 @@ class GASNet(nn.Module):
         self.use_attention_local = use_attention_local
         self.num_parts = num_parts
         self.backbone_type = backbone
+        self._is_convnext = backbone == "dinov3_convnext"
+
         if backbone == "swin_t":
             self.swin_backbone = SwinBackbone(pretrained=use_pretrained)
+        elif self._is_convnext:
+            self.convnext_backbone = DINOv3ConvNeXtBackbone(pretrained=use_pretrained)
         elif backbone == "resnet50":
             weights = models.ResNet50_Weights.DEFAULT if use_pretrained else None
             base = models.resnet50(weights=weights)
@@ -700,55 +780,70 @@ class GASNet(nn.Module):
                 _load_matching_resnet50_weights(base)
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
-        
-        if backbone != "swin_t":
+
+        # Channel dimensions per backbone
+        if self._is_convnext:
+            c1, c2, c3, c4 = 96, 192, 384, 768
+            dim_fs = 192
+        else:
+            c1, c2, c3, c4 = 256, 512, 1024, 2048
+            dim_fs = 512
+
+        if backbone not in ("swin_t",) and not self._is_convnext:
             self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
             self.layer1 = base.layer1
             self.layer2 = base.layer2
             self.layer3 = base.layer3
             self.layer4 = base.layer4
-            self.ga1 = RGABlock(256, spatial_size=(56, 56))
-            self.ga2 = RGABlock(512, spatial_size=(28, 28))
-            self.ga3 = RGABlock(1024, spatial_size=(14, 14))
-            self.ga4 = RGABlock(2048, spatial_size=(7, 7))
-        
-        self.fs1 = OSBlockFS(1024, 512)
-        self.fs2 = OSBlockFS(512, 512)
+            self.ga1 = RGABlock(c1, spatial_size=(56, 56))
+            self.ga2 = RGABlock(c2, spatial_size=(28, 28))
+            self.ga3 = RGABlock(c3, spatial_size=(14, 14))
+            self.ga4 = RGABlock(c4, spatial_size=(7, 7))
+
+        # ConvNeXt: keep all 4 RGA blocks, identical flow to ResNet
+        if self._is_convnext:
+            self.ga1 = RGABlock(c1, spatial_size=(56, 56))
+            self.ga2 = RGABlock(c2, spatial_size=(28, 28))
+            self.ga3 = RGABlock(c3, spatial_size=(14, 14))
+            self.ga4 = RGABlock(c4, spatial_size=(7, 7))
+
+        self.fs1 = OSBlockFS(c3, dim_fs)
+        self.fs2 = OSBlockFS(dim_fs, dim_fs)
         
         self.gap = GeMPool(p=gem_p) if use_gem else nn.AdaptiveAvgPool2d(1)
-        self.bnneck_global = BNNeck(2048)
-        self.bnneck_fs = BNNeck(512)
+        self.bnneck_global = BNNeck(c4)
+        self.bnneck_fs = BNNeck(dim_fs)
         if self.use_part_branch:
             self.part_reduce = nn.Sequential(
-                nn.Linear(2048 * num_parts, 512, bias=False),
-                nn.BatchNorm1d(512),
+                nn.Linear(c4 * num_parts, dim_fs, bias=False),
+                nn.BatchNorm1d(dim_fs),
                 nn.ReLU(inplace=True),
             )
-            self.bnneck_part = BNNeck(512)
-            self.classifier_part = nn.Linear(512, num_classes, bias=False)
+            self.bnneck_part = BNNeck(dim_fs)
+            self.classifier_part = nn.Linear(dim_fs, num_classes, bias=False)
         if self.use_attention_local:
             self.attn_local = AttentionLocalBranch(
-                in_channels=2048,
+                in_channels=c4,
                 num_heads=num_attention_heads,
             )
-            # Per-head reduction: 2048 -> 256
+            # Per-head reduction: c4 -> 256
             self.attn_head_reduce = nn.ModuleList([
-                nn.Linear(2048, 256, bias=False)
+                nn.Linear(c4, 256, bias=False)
                 for _ in range(num_attention_heads)
             ])
-            # Concat reduction: 256*num_heads -> 512
+            # Concat reduction: 256*num_heads -> dim_fs
             self.attn_local_reduce = nn.Sequential(
                 nn.BatchNorm1d(256 * num_attention_heads),
                 nn.ReLU(inplace=True),
-                nn.Linear(256 * num_attention_heads, 512, bias=False),
-                nn.BatchNorm1d(512),
+                nn.Linear(256 * num_attention_heads, dim_fs, bias=False),
+                nn.BatchNorm1d(dim_fs),
                 nn.ReLU(inplace=True),
             )
-            self.bnneck_attn_local = BNNeck(512)
-            self.classifier_attn_local = nn.Linear(512, num_classes, bias=False)
+            self.bnneck_attn_local = BNNeck(dim_fs)
+            self.classifier_attn_local = nn.Linear(dim_fs, num_classes, bias=False)
         
-        self.classifier_global = nn.Linear(2048, num_classes, bias=False)
-        self.classifier_fs = nn.Linear(512, num_classes, bias=False)
+        self.classifier_global = nn.Linear(c4, num_classes, bias=False)
+        self.classifier_fs = nn.Linear(dim_fs, num_classes, bias=False)
 
     def _part_pool(self, x: torch.Tensor) -> torch.Tensor:
         stripes = torch.chunk(x, self.num_parts, dim=2)
@@ -760,7 +855,7 @@ class GASNet(nn.Module):
         target_mean: float = 0.55,
         std_margin: float = 0.08,
     ) -> torch.Tensor:
-        # Swin backbone does not use RGA blocks (has built-in self-attention)
+        # Swin backbone does not use RGA blocks
         if self.backbone_type == "swin_t":
             return next(self.parameters()).sum() * 0.0
         losses = []
@@ -783,6 +878,22 @@ class GASNet(nn.Module):
             fs = self.fs1(feat3)
             fs = self.fs2(fs)
             x = feat4
+        elif self._is_convnext:
+            x = self.convnext_backbone.stem(x)
+            
+            x = self.convnext_backbone.stage1(x)
+            x = self.ga1(x)
+            
+            x = self.convnext_backbone.stage2(x)
+            x = self.ga2(x)
+            
+            x = self.convnext_backbone.stage3(x)
+            fs = self.fs1(x)
+            fs = self.fs2(fs)
+            x = self.ga3(x)
+            
+            x = self.convnext_backbone.stage4(x)
+            x = self.ga4(x)
         else:
             x = self.stem(x)
             x = self.layer1(x)
@@ -1265,7 +1376,6 @@ def main() -> None:
     if batch_size % pk_k != 0:
         raise ValueError(f"--batch-size must be divisible by k={pk_k}, got {batch_size}")
     pk_p = batch_size // pk_k
-    learning_rate = args.base_lr * (batch_size / args.base_batch_size)
 
     train_loader = make_pk_loader(
         train_samples,
@@ -1285,6 +1395,8 @@ def main() -> None:
         dataset_cls=dataset_cls,
     )
 
+    use_convnext = args.backbone.startswith("dinov3_convnext")
+
     model = GASNet(
         num_classes=num_classes,
         use_pretrained=not args.no_pretrained,
@@ -1295,6 +1407,8 @@ def main() -> None:
         backbone=args.backbone,
         use_attention_local=args.use_attention_local,
         num_attention_heads=args.num_attention_heads,
+        convnext_pretrained_path=args.convnext_pretrained_path,
+        freeze_convnext_stages=args.freeze_convnext_stages,
     ).to(device)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -1303,17 +1417,71 @@ def main() -> None:
         print("Compiling model with torch.compile...")
         model = torch.compile(model, mode="reduce-overhead")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=5e-4)
-    warmup_epochs = 5
-    milestones = [40, 50]
+    if use_convnext:
+        # ── Discriminative LR for ConvNeXt ──
+        # Backbone (pretrained DINOv3 weights) gets a low LR;
+        # Everything else (RGA, head, classifier, FS, BNNeck) get a high LR.
+        backbone_lr = args.backbone_lr   # default 3e-5
+        head_lr = args.head_lr           # default 3e-4
+        weight_decay = args.convnext_weight_decay  # default 0.05
+        warmup_epochs = args.convnext_warmup_epochs  # default 10
 
-    def lr_lambda(epoch: int) -> float:
-        if epoch < warmup_epochs:
-            return float(epoch + 1) / warmup_epochs
-        drops = sum(epoch + 1 >= m for m in milestones)
-        return 0.1 ** drops
+        backbone_params = []
+        head_params = []
+        base_model = getattr(model, "_orig_mod", model)
+        for name, param in base_model.named_parameters():
+            if not param.requires_grad:
+                continue
+            # ConvNeXt backbone (HuggingFace backbone inside DINOv3ConvNeXtBackbone)
+            if "convnext_backbone." in name:
+                backbone_params.append(param)
+            else:
+                head_params.append(param)
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        param_groups = [
+            {"params": backbone_params, "lr": backbone_lr, "name": "convnext_backbone"},
+            {"params": head_params,     "lr": head_lr, "name": "head_classifier"},
+        ]
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+
+        print(f"  ConvNeXt discriminative LR: backbone={backbone_lr}, "
+              f"head={head_lr}, wd={weight_decay}")
+        print(f"  Param counts: backbone={len(backbone_params)}, "
+              f"head={len(head_params)}")
+
+        # Warmup (linear) → Cosine decay
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+        warmup_scheduler = LinearLR(
+            optimizer,
+            start_factor=0.01,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, args.epochs - warmup_epochs),
+            eta_min=1e-7,
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
+        )
+    else:
+        # ── Original Adam + milestone schedule for ResNet / Swin ──
+        learning_rate = args.base_lr * (batch_size / args.base_batch_size)
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=5e-4)
+        warmup_epochs = 5
+        milestones = [40, 50]
+
+        def lr_lambda(epoch: int) -> float:
+            if epoch < warmup_epochs:
+                return float(epoch + 1) / warmup_epochs
+            drops = sum(epoch + 1 >= m for m in milestones)
+            return 0.1 ** drops
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # New API first, old API fallback for compatibility.
     try:
@@ -1321,9 +1489,13 @@ def main() -> None:
     except Exception:
         scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
+    if use_convnext:
+        lr_info = f"backbone_lr={args.backbone_lr}, head_lr={args.head_lr}, wd={args.convnext_weight_decay}"
+    else:
+        lr_info = f"lr={args.base_lr * (batch_size / args.base_batch_size):.6f}"
     print(
         f"device={device}, amp={use_amp}, amp_dtype={amp_dtype}, channels_last={use_channels_last}, "
-        f"batch={batch_size}, lr={learning_rate:.6f}, grad_accum={args.grad_accum}, "
+        f"batch={batch_size}, {lr_info}, grad_accum={args.grad_accum}, "
         f"workers={args.num_workers}, pin_memory={pin_memory}, persistent_workers={persistent_workers}, "
         f"dataset={args.dataset}, camera_balanced={args.dataset == 'vrai' and not args.disable_camera_balanced_sampler}, "
         f"attr_hard_negative={args.dataset == 'vrai' and not args.disable_attribute_hard_negative_sampler}, "

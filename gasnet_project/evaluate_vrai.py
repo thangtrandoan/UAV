@@ -1173,7 +1173,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-attention-heads", type=int, default=4, help="Number of attention maps used by the local branch")
     parser.add_argument("--use-gem", action="store_true", help="Load/evaluate a checkpoint trained with GeM pooling")
     parser.add_argument("--gem-p", type=float, default=3.0, help="GeM pooling exponent")
-    parser.add_argument("--backbone", choices=["resnet50", "resnet50_ibn", "swin_t"], default="resnet50")
+    parser.add_argument("--backbone", choices=[
+        "resnet50", "resnet50_ibn", "swin_t", "dinov3_convnext"
+    ], default="resnet50")
     parser.add_argument("--tta-flip", action="store_true", help="Average original and horizontal-flip features")
     parser.add_argument("--analyze-failures", action="store_true", help="Write detailed Rank-1 failure analysis for eval mode")
     parser.add_argument("--analysis-output-dir", type=Path, default=Path("output/vrai_failure_analysis"))
