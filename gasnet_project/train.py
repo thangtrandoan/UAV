@@ -1407,8 +1407,6 @@ def main() -> None:
         backbone=args.backbone,
         use_attention_local=args.use_attention_local,
         num_attention_heads=args.num_attention_heads,
-        convnext_pretrained_path=args.convnext_pretrained_path,
-        freeze_convnext_stages=args.freeze_convnext_stages,
     ).to(device)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
