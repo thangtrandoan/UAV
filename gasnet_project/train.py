@@ -170,6 +170,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--no-channels-last", action="store_true")
     parser.add_argument("--no-pretrained", action="store_true", help="Disable pretrained ResNet-50 weights")
+    parser.add_argument(
+        "--econvnext",
+        action="store_true",
+        help="Dung kien truc E-ConvNeXt (phuong an II) thay vi DINOv3 goc",
+    )
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--eval-q-chunk-size", type=int, default=2048, help="Query chunk size for retrieval evaluation")
     parser.add_argument("--no-fp16-sim", action="store_true", help="Disable fp16/bf16 similarity matmul during evaluation")
@@ -681,6 +686,165 @@ class SwinBackbone(nn.Module):
         return feat1, feat2, feat3, feat4
 
 
+# ---------------------------------------------------------------------------
+# E-ConvNeXt (arXiv 2508.20955) — ap cho stages[0..1], rieng E (LN->BN) toan mang
+# ---------------------------------------------------------------------------
+
+
+class EffectiveSELayer(nn.Module):
+    """Effective Squeeze-Excitation (CenterMask, arXiv 1911.06667).
+
+    GAP -> Conv 1x1 (C -> C) -> Hardsigmoid -> nhan. Khong bottleneck.
+
+    Khoi tao fc.weight = 0 va fc.bias = 0 nen cong = hardsigmoid(0) = 0.5.
+    Vi vay norm2.weight phai dat bang 2 * gamma de bu, giu dung thang
+    per-channel ma DINOv3 da hoc. Dao ham qua Hardsigmoid tai 0 la 1/6 (khac 0)
+    nen gradient van chay binh thuong.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.fc = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.act = nn.Hardsigmoid()
+        nn.init.zeros_(self.fc.weight)
+        nn.init.zeros_(self.fc.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_se = x.mean(dim=(2, 3), keepdim=True)
+        return x * self.act(self.fc(x_se))
+
+
+class EConvNeXtBlock(nn.Module):
+    """ConvNeXt block theo E-ConvNeXt.
+
+    Khac ConvNeXt goc:
+      - BatchNorm thay LayerNorm, bo han 2 lan permute NCHW <-> NHWC
+      - 1x1 Conv thay Linear
+      - them norm2 (BatchNorm) sau pointwise_conv2
+      - ESE thay LayerScale; gamma bi bo
+      - drop_path khong dung (drop_path_rate cua DINOv3 = 0.0 nen vo nghia)
+    """
+
+    def __init__(self, dim: int, use_ese: bool = True):
+        super().__init__()
+        self.depthwise_conv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = nn.BatchNorm2d(dim)
+        self.pointwise_conv1 = nn.Conv2d(dim, 4 * dim, kernel_size=1)
+        self.activation_fn = nn.GELU()
+        self.pointwise_conv2 = nn.Conv2d(4 * dim, dim, kernel_size=1)
+        self.norm2 = nn.BatchNorm2d(dim)
+        self.ese = EffectiveSELayer(dim) if use_ese else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.depthwise_conv(x)
+        x = self.norm(x)
+        x = self.pointwise_conv1(x)
+        x = self.activation_fn(x)
+        x = self.pointwise_conv2(x)
+        x = self.norm2(x)
+        if self.ese is not None:
+            x = self.ese(x)
+        return residual + x
+
+
+class ConvBNGELU(nn.Module):
+    """Conv + BatchNorm + GELU — dung cho stem va CSPStage.
+
+    Khop ConvBNLayer cua tac gia, trong do GELU luon duoc ap (ke ca conv cuoi
+    cua stage) du tham so `act` co duoc truyen hay khong.
+    """
+
+    def __init__(self, ch_in: int, ch_out: int, kernel_size: int, stride: int = 1, padding: int = 0):
+        super().__init__()
+        self.conv = nn.Conv2d(ch_in, ch_out, kernel_size, stride=stride, padding=padding)
+        self.bn = nn.BatchNorm2d(ch_out)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.bn(self.conv(x)))
+
+
+class EConvNeXtStem(nn.Module):
+    """Stem 'vb' cua E-ConvNeXt: 3 conv, TONG STRIDE 2 (khong phai 4).
+
+    Conv(3 -> C/2, 2x2, s2) -> Conv(C/2 -> C/2, 3x3, s1) -> Conv(C/2 -> C, 3x3, s1)
+    224 -> 112. Nua stride con lai do CSPStage.down cua stages[0] lo.
+    """
+
+    def __init__(self, out_channels: int = 64):
+        super().__init__()
+        mid = out_channels // 2
+        self.conv1 = ConvBNGELU(3, mid, 2, stride=2, padding=0)
+        self.conv2 = ConvBNGELU(mid, mid, 3, stride=1, padding=1)
+        self.conv3 = ConvBNGELU(mid, out_channels, 3, stride=1, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv3(self.conv2(self.conv1(x)))
+
+
+class CSPStage(nn.Module):
+    """CSP Stage cua E-ConvNeXt.
+
+    ch_mid = (ch_in + ch_out) // 2 ; block chay o ch_mid // 2.
+    down (2x2, s2) -> conv1 (nhanh bypass) / conv2 -> blocks, roi concat,
+    ese, conv3.
+    """
+
+    def __init__(
+        self,
+        ch_in: int,
+        ch_out: int,
+        num_blocks: int,
+        stride: int = 2,
+        use_ese: bool = True,
+    ):
+        super().__init__()
+        ch_mid = (ch_in + ch_out) // 2
+        self.ch_in = ch_in
+        self.ch_out = ch_out
+        self.ch_mid = ch_mid
+        self.block_dim = ch_mid // 2
+        self.down = ConvBNGELU(ch_in, ch_mid, 2, stride=2) if stride == 2 else nn.Identity()
+        self.conv1 = ConvBNGELU(ch_mid, ch_mid // 2, 1)
+        self.conv2 = ConvBNGELU(ch_mid, ch_mid // 2, 1)
+        self.blocks = nn.Sequential(
+            *[EConvNeXtBlock(ch_mid // 2, use_ese=use_ese) for _ in range(num_blocks)]
+        )
+        self.attn = EffectiveSELayer(ch_mid) if use_ese else None
+        self.conv3 = ConvBNGELU(ch_mid, ch_out, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.down(x)
+        y1 = self.conv1(x)
+        y2 = self.blocks(self.conv2(x))
+        y = torch.cat([y1, y2], dim=1)
+        if self.attn is not None:
+            y = self.attn(y)
+        return self.conv3(y)
+
+
+class EConvNeXtStage(nn.Module):
+    """Stage kieu DINOv3 nhung block la EConvNeXtBlock — dung cho stages[2..3].
+
+    downsample_layers = [BatchNorm(ch_in), Conv2d(ch_in -> ch_out, 2x2, s2)]
+    (DINOv3 goc dung LayerNorm o day, E thay bang BatchNorm.)
+    """
+
+    def __init__(self, ch_in: int, ch_out: int, num_blocks: int, use_ese: bool = False):
+        super().__init__()
+        self.downsample_layers = nn.Sequential(
+            nn.BatchNorm2d(ch_in),
+            nn.Conv2d(ch_in, ch_out, kernel_size=2, stride=2),
+        )
+        self.layers = nn.Sequential(
+            *[EConvNeXtBlock(ch_out, use_ese=use_ese) for _ in range(num_blocks)]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(self.downsample_layers(x))
+
+
 class DINOv3ConvNeXtBackbone(nn.Module):
     """DINOv3 ConvNeXt-Small (LVD-1689M) via HuggingFace.
 
@@ -700,7 +864,66 @@ class DINOv3ConvNeXtBackbone(nn.Module):
     Native channel dims: (96, 192, 384, 768)
     """
 
-    def __init__(self, pretrained: bool = True):
+    CNN_DIMS = (96, 192, 384, 768)
+    CNN_DEPTHS = (3, 3, 27, 3)
+
+    @staticmethod
+    def _copy_block_(dst: "EConvNeXtBlock", src, idx=None):
+        """Chuyen 1 block ConvNeXt cua HF sang EConvNeXtBlock.
+
+        idx = LongTensor chi so kenh giu lai, None = giu het.
+        gamma -> norm2.weight = 2*gamma. Cong ESE luc init = hardsigmoid(0) = 0.5
+        nen 0.5 * 2*gamma = gamma, giu dung thang per-channel cua pretrain.
+        """
+        dw = src.depthwise_conv.weight.data
+        lnw, lnb = src.layer_norm.weight.data, src.layer_norm.bias.data
+        p1w, p1b = src.pointwise_conv1.weight.data, src.pointwise_conv1.bias.data
+        p2w, p2b = src.pointwise_conv2.weight.data, src.pointwise_conv2.bias.data
+        gam = src.gamma.data
+
+        if idx is None:
+            dst.depthwise_conv.weight.data.copy_(dw)
+            dst.norm.weight.data.copy_(lnw)
+            dst.norm.bias.data.copy_(lnb)
+            dst.pointwise_conv1.weight.data.copy_(p1w[:, :, None, None])
+            dst.pointwise_conv1.bias.data.copy_(p1b)
+            dst.pointwise_conv2.weight.data.copy_(p2w[:, :, None, None])
+            dst.pointwise_conv2.bias.data.copy_(p2b)
+            dst.norm2.weight.data.copy_(2.0 * gam)
+            dst.norm2.bias.data.zero_()
+            return
+
+        k = int(idx.numel())
+        dst.depthwise_conv.weight.data.copy_(dw.index_select(0, idx))
+        dst.depthwise_conv.bias.data.zero_()
+        dst.norm.weight.data.copy_(lnw.index_select(0, idx))
+        dst.norm.bias.data.copy_(lnb.index_select(0, idx))
+        # Don vi an: giu 4k don vi quan trong nhat theo ||pw1 row|| * ||pw2 col||
+        imp = p1w.norm(dim=1) * p2w.norm(dim=0)
+        hid = torch.topk(imp, 4 * k).indices
+        dst.pointwise_conv1.weight.data.copy_(
+            p1w.index_select(0, hid).index_select(1, idx)[:, :, None, None]
+        )
+        dst.pointwise_conv1.bias.data.copy_(p1b.index_select(0, hid))
+        dst.pointwise_conv2.weight.data.copy_(
+            p2w.index_select(0, idx).index_select(1, hid)[:, :, None, None]
+        )
+        dst.pointwise_conv2.bias.data.copy_(p2b.index_select(0, idx))
+        dst.norm2.weight.data.copy_(2.0 * gam.index_select(0, idx))
+        dst.norm2.bias.data.zero_()
+
+    @staticmethod
+    def _stage_channel_index_(src_stage, keep: int) -> torch.Tensor:
+        """Chon `keep` kenh quan trong nhat cua 1 stage theo |gamma| trung binh.
+
+        Chi so nay dung CHUNG cho moi block trong stage, vi cac block trong cung
+        mot stage chia se cung khong gian kenh — moi block mot tap con khac nhau
+        se lam kenh lech nghia giua cac block.
+        """
+        gam_mean = torch.stack([b.gamma.data.abs() for b in src_stage.layers]).mean(dim=0)
+        return torch.topk(gam_mean, keep).indices
+
+    def __init__(self, pretrained: bool = True, econvnext: bool = False):
         super().__init__()
         from transformers import AutoModel, AutoConfig
         from huggingface_hub import get_token
@@ -724,25 +947,90 @@ class DINOv3ConvNeXtBackbone(nn.Module):
             config = AutoConfig.from_pretrained(model_name, **kwargs)
             full_model = AutoModel.from_config(config)
 
-        # Split model into individual stages for sequential execution
-        if hasattr(full_model, "embeddings"):
-            # Standard HuggingFace ConvNeXt layout
-            self.stem = full_model.embeddings
-            self.stage1 = full_model.encoder.stages[0]
-            self.stage2 = full_model.encoder.stages[1]
-            self.stage3 = full_model.encoder.stages[2]
-            self.stage4 = full_model.encoder.stages[3]
-        else:
-            # DINOv3 ConvNeXt: embeddings folded into stage 0
-            self.stem = nn.Identity()
-            self.stage1 = full_model.model.stages[0]
-            self.stage2 = full_model.model.stages[1]
-            self.stage3 = full_model.model.stages[2]
-            self.stage4 = full_model.model.stages[3]
+        self.econvnext = bool(econvnext)
 
-        # Release reference to full model (sub-modules already moved to self.*)
+        if not self.econvnext:
+            # Duong cu: giu nguyen kien truc DINOv3 goc
+            if hasattr(full_model, "embeddings"):
+                # Standard HuggingFace ConvNeXt layout
+                self.stem = full_model.embeddings
+                self.stage1 = full_model.encoder.stages[0]
+                self.stage2 = full_model.encoder.stages[1]
+                self.stage3 = full_model.encoder.stages[2]
+                self.stage4 = full_model.encoder.stages[3]
+            else:
+                # DINOv3 ConvNeXt: embeddings folded into stage 0
+                self.stem = nn.Identity()
+                self.stage1 = full_model.model.stages[0]
+                self.stage2 = full_model.model.stages[1]
+                self.stage3 = full_model.model.stages[2]
+                self.stage4 = full_model.model.stages[3]
+            del full_model
+            print("  DINOv3 ConvNeXt-Small backbone ready")
+            return
+
+        # --- E-ConvNeXt: stem vb + CSPStage cho stages[0..1], E cho toan mang ---
+        # stem vb tong stride 2 -> 64 @112x112; CSPStage.down lo nua stride con lai.
+        self.stem = EConvNeXtStem(out_channels=64)
+        self.stage1 = CSPStage(64, 96, num_blocks=3, stride=2, use_ese=True)
+        self.stage2 = CSPStage(96, 192, num_blocks=3, stride=2, use_ese=True)
+        self.stage3 = EConvNeXtStage(192, 384, num_blocks=27, use_ese=False)
+        self.stage4 = EConvNeXtStage(384, 768, num_blocks=3, use_ese=False)
+
+        n_full, n_sliced = self._load_dinov3_weights_(full_model)
         del full_model
-        print("  DINOv3 ConvNeXt-Small backbone ready")
+        print(
+            f"  E-ConvNeXt backbone ready: {n_full} block copy nguyen, "
+            f"{n_sliced} block cat bot kenh"
+        )
+
+    def _load_dinov3_weights_(self, full_model):
+        """Chuyen trong so DINOv3 pretrain sang kien truc E-ConvNeXt.
+
+        - stages[2..3]: giu nguyen so kenh => copy thang
+        - stages[0..1]: block chay o 40/72 kenh (CSP) => cat bot kenh theo |gamma|
+        - stem / conv1,conv2,conv3 / attn / down cua CSPStage: khong co tuong ung
+          => init moi
+        """
+        if not hasattr(full_model, "model"):
+            raise RuntimeError("Chi ho tro layout DINOv3 (full_model.model.stages)")
+        src = full_model.model.stages
+        n_full = n_sliced = 0
+
+        # stages[2..3] — giu nguyen so kenh
+        for si, dst_stage in ((2, self.stage3), (3, self.stage4)):
+            s = src[si]
+            dst_stage.downsample_layers[0].weight.data.copy_(s.downsample_layers[0].weight.data)
+            dst_stage.downsample_layers[0].bias.data.copy_(s.downsample_layers[0].bias.data)
+            dst_stage.downsample_layers[1].weight.data.copy_(s.downsample_layers[1].weight.data)
+            dst_stage.downsample_layers[1].bias.data.copy_(s.downsample_layers[1].bias.data)
+            for i in range(len(dst_stage.layers)):
+                self._copy_block_(dst_stage.layers[i], s.layers[i], idx=None)
+                n_full += 1
+
+        # stages[0] -> CSPStage(64 -> 96), block @40 cat tu block @96
+        s0 = src[0]
+        idx0 = self._stage_channel_index_(s0, self.stage1.block_dim)
+        for i in range(len(self.stage1.blocks)):
+            self._copy_block_(self.stage1.blocks[i], s0.layers[i], idx=idx0)
+            n_sliced += 1
+
+        # stages[1] -> CSPStage(96 -> 192), block @72 cat tu block @192
+        s1 = src[1]
+        idx1 = self._stage_channel_index_(s1, self.stage2.block_dim)
+        for i in range(len(self.stage2.blocks)):
+            self._copy_block_(self.stage2.blocks[i], s1.layers[i], idx=idx1)
+            n_sliced += 1
+        # down cua stage 1: Conv(96->192, 2x2, s2) cat con ch_mid = 144 kenh ra
+        dst_down = self.stage2.down.conv
+        dst_down.weight.data.copy_(s1.downsample_layers[1].weight.data[: self.stage2.ch_mid])
+        src_bias = s1.downsample_layers[1].bias
+        if src_bias is not None:
+            dst_down.bias.data.copy_(src_bias.data[: self.stage2.ch_mid])
+        else:
+            dst_down.bias.data.zero_()
+
+        return n_full, n_sliced
 
 
 class GASNet(nn.Module):
@@ -757,6 +1045,7 @@ class GASNet(nn.Module):
         backbone: str = "resnet50",
         use_attention_local: bool = False,
         num_attention_heads: int = 4,
+        econvnext: bool = False,
     ):
         super().__init__()
         if num_parts < 1:
@@ -770,7 +1059,9 @@ class GASNet(nn.Module):
         if backbone == "swin_t":
             self.swin_backbone = SwinBackbone(pretrained=use_pretrained)
         elif self._is_convnext:
-            self.convnext_backbone = DINOv3ConvNeXtBackbone(pretrained=use_pretrained)
+            self.convnext_backbone = DINOv3ConvNeXtBackbone(
+                pretrained=use_pretrained, econvnext=econvnext
+            )
         elif backbone == "resnet50":
             weights = models.ResNet50_Weights.DEFAULT if use_pretrained else None
             base = models.resnet50(weights=weights)
@@ -941,7 +1232,14 @@ class GASNet(nn.Module):
             if self.use_part_branch:
                 return (global_feat, fs_feat, part_feat), (logits_global, logits_fs, logits_part)
             return (global_feat, fs_feat), (logits_global, logits_fs)
-        
+            
+        if getattr(self, "return_raw_features_eval", False):
+            if self.use_attention_local:
+                return global_feat, fs_feat, attn_local_feat
+            if self.use_part_branch:
+                return global_feat, fs_feat, part_feat
+            return global_feat, fs_feat
+
         if self.use_attention_local:
             return bn_global, bn_fs, bn_attn_local
         if self.use_part_branch:
@@ -1407,6 +1705,7 @@ def main() -> None:
         backbone=args.backbone,
         use_attention_local=args.use_attention_local,
         num_attention_heads=args.num_attention_heads,
+        econvnext=args.econvnext,
     ).to(device)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
