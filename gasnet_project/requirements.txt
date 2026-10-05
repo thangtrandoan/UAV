@@ -7,3 +7,5 @@ Pillow==10.3.0
 #   pip install --no-index --find-links /path/to/wheels -r requirements.txt
 torch==2.3.1
 torchvision==0.18.1
+transformers>=4.32.0
+huggingface-hub

@@ -15,7 +15,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor \
-    TORCH_HOME=/opt/torch_cache
+    TORCH_HOME=/opt/torch_cache \
+    HF_HOME=/opt/huggingface_cache
 
 WORKDIR /workspace/gasnet_project
 
@@ -25,7 +26,7 @@ COPY requirements.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt
 
-RUN mkdir -p ${TORCH_HOME} \
+RUN mkdir -p ${TORCH_HOME} ${HF_HOME} \
     && python - <<'PY'
 import torch
 from torchvision import models
@@ -35,9 +36,16 @@ print("Cached ResNet-50 weights")
 
 _ = models.swin_t(weights=models.Swin_T_Weights.DEFAULT)
 print("Cached Swin-T weights")
+
+try:
+    from transformers import AutoModel
+    _ = AutoModel.from_pretrained("facebook/dinov3-convnext-small-pretrain-lvd1689m")
+    print("Cached DINOv3 ConvNeXt weights")
+except ImportError:
+    pass
 PY
 
-COPY train.py dataset.py utils.py evaluation.py evaluate_vrai.py ./
+COPY *.py ./
 COPY entrypoint.sh /workspace/entrypoint.sh
 RUN chmod +x /workspace/entrypoint.sh
 

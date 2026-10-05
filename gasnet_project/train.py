@@ -691,6 +691,40 @@ class SwinBackbone(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+# ============================================================================
+# E-ConvNeXt: cac lop thay the backbone DINOv3 (xem md/1thg10.md)
+# ============================================================================
+
+# sigma_b = std kenh cua nhanh residual (dau ra pointwise_conv2) tren DINOv3
+# pretrain, do bang tools/measure_sigma_b.py tren 8 anh that.
+# BatchNorm trong norm2 ep nhanh ve phuong sai 1, nen phai nhan lai sigma_b de
+# khoi phuc dung do loi pretrain gamma * sigma_b.
+SIGMA_B = (0.173, 0.169, 0.127, 0.155)   # stages[0..3]
+
+
+class LayerNorm2d(nn.Module):
+    """LayerNorm kieu DINOv3: chuan hoa qua kenh tai tung vi tri.
+
+    DINOv3 dung layer_norm_eps = 1e-6, khac mac dinh 1e-5 cua nn.LayerNorm, nen
+    phai truyen eps tuong minh.
+
+    Giu tham so ten weight/bias giong BatchNorm2d de _copy_block_ va audit dung
+    chung mot duong copy.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.normalized_shape = (dim,)
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 3, 1)
+        x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        return x.permute(0, 3, 1, 2)
+
+
 class EffectiveSELayer(nn.Module):
     """Effective Squeeze-Excitation (CenterMask, arXiv 1911.06667).
 
@@ -717,23 +751,40 @@ class EffectiveSELayer(nn.Module):
 class EConvNeXtBlock(nn.Module):
     """ConvNeXt block theo E-ConvNeXt.
 
-    Khac ConvNeXt goc:
-      - BatchNorm thay LayerNorm, bo han 2 lan permute NCHW <-> NHWC
-      - 1x1 Conv thay Linear
-      - them norm2 (BatchNorm) sau pointwise_conv2
-      - ESE thay LayerScale; gamma bi bo
+    Giu LayerNorm cua DINOv3 (LayerNorm2d), khong doi sang BatchNorm. Day la
+    quyet dinh co do luong: doi LayerNorm -> BatchNorm ben trong mot block da
+    pretrain lam moi block lech 38%, don 27 block thanh 5 lan o dau ra stage3
+    (std 17.0 so voi 3.44). Bo thay doi do thi stage3/stage4 tai tao DINOv3
+    chinh xac (lech 0.000).
+
+    Cac thay doi con lai so voi ConvNeXt goc:
+      - 1x1 Conv thay Linear (tuong duong toan hoc, chi khac layout)
+      - ESE thay LayerScale o stages[0..1]
       - drop_path khong dung (drop_path_rate cua DINOv3 = 0.0 nen vo nghia)
+
+    norm2 la module MOI (chi co khi dung ESE) nen dung BatchNorm: no ep tung kenh
+    ve phuong sai 1, nho do weight = 2*gamma*sigma_b moi dieu khien dung thang
+    cua tung kenh. LayerNorm khong cho tinh chat do.
     """
 
-    def __init__(self, dim: int, use_ese: bool = True):
+    def __init__(self, dim: int, use_ese: bool = True, sigma_b: float = 0.17):
         super().__init__()
+        # depthwise_conv cua DINOv3 CO bias, phai copy ca bias nay (xem _copy_block_).
         self.depthwise_conv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
-        self.norm = nn.BatchNorm2d(dim)
+        self.norm = LayerNorm2d(dim)
         self.pointwise_conv1 = nn.Conv2d(dim, 4 * dim, kernel_size=1)
         self.activation_fn = nn.GELU()
         self.pointwise_conv2 = nn.Conv2d(4 * dim, dim, kernel_size=1)
-        self.norm2 = nn.BatchNorm2d(dim)
-        self.ese = EffectiveSELayer(dim) if use_ese else None
+        self.sigma_b = sigma_b
+        if use_ese:
+            self.norm2 = nn.BatchNorm2d(dim)
+            self.ese = EffectiveSELayer(dim)
+            self.gamma = None
+        else:
+            self.norm2 = None
+            self.ese = None
+            # LayerScale giong DINOv3; gia tri that duoc nap tu pretrain.
+            self.gamma = nn.Parameter(torch.full((dim,), 1e-6))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -742,9 +793,10 @@ class EConvNeXtBlock(nn.Module):
         x = self.pointwise_conv1(x)
         x = self.activation_fn(x)
         x = self.pointwise_conv2(x)
-        x = self.norm2(x)
-        if self.ese is not None:
-            x = self.ese(x)
+        if self.norm2 is not None:
+            x = self.ese(self.norm2(x))
+        else:
+            x = x * self.gamma.view(1, -1, 1, 1)
         return residual + x
 
 
@@ -798,6 +850,7 @@ class CSPStage(nn.Module):
         num_blocks: int,
         stride: int = 2,
         use_ese: bool = True,
+        sigma_b: float = 0.17,
     ):
         super().__init__()
         ch_mid = (ch_in + ch_out) // 2
@@ -809,7 +862,8 @@ class CSPStage(nn.Module):
         self.conv1 = ConvBNGELU(ch_mid, ch_mid // 2, 1)
         self.conv2 = ConvBNGELU(ch_mid, ch_mid // 2, 1)
         self.blocks = nn.Sequential(
-            *[EConvNeXtBlock(ch_mid // 2, use_ese=use_ese) for _ in range(num_blocks)]
+            *[EConvNeXtBlock(ch_mid // 2, use_ese=use_ese, sigma_b=sigma_b)
+              for _ in range(num_blocks)]
         )
         self.attn = EffectiveSELayer(ch_mid) if use_ese else None
         self.conv3 = ConvBNGELU(ch_mid, ch_out, 1)
@@ -827,14 +881,14 @@ class CSPStage(nn.Module):
 class EConvNeXtStage(nn.Module):
     """Stage kieu DINOv3 nhung block la EConvNeXtBlock — dung cho stages[2..3].
 
-    downsample_layers = [BatchNorm(ch_in), Conv2d(ch_in -> ch_out, 2x2, s2)]
-    (DINOv3 goc dung LayerNorm o day, E thay bang BatchNorm.)
+    downsample_layers = [LayerNorm(ch_in), Conv2d(ch_in -> ch_out, 2x2, s2)]
+    giong DINOv3 goc.
     """
 
     def __init__(self, ch_in: int, ch_out: int, num_blocks: int, use_ese: bool = False):
         super().__init__()
         self.downsample_layers = nn.Sequential(
-            nn.BatchNorm2d(ch_in),
+            LayerNorm2d(ch_in),
             nn.Conv2d(ch_in, ch_out, kernel_size=2, stride=2),
         )
         self.layers = nn.Sequential(
@@ -872,8 +926,15 @@ class DINOv3ConvNeXtBackbone(nn.Module):
         """Chuyen 1 block ConvNeXt cua HF sang EConvNeXtBlock.
 
         idx = LongTensor chi so kenh giu lai, None = giu het.
-        gamma -> norm2.weight = 2*gamma. Cong ESE luc init = hardsigmoid(0) = 0.5
-        nen 0.5 * 2*gamma = gamma, giu dung thang per-channel cua pretrain.
+
+        Do loi nhanh residual (do tren DINOv3 pretrain, xem tools/measure_sigma_b.py):
+            sigma_b = std kenh cua dau ra pointwise_conv2, ~0.13 - 0.17
+            DINOv3 goc:  nhanh vao residual = gamma * b   -> std ~ gamma * sigma_b
+
+        use_ese=False: gamma * b                       -> khop y nguyen DINOv3
+        use_ese=True : norm2 ep b ve phuong sai 1, nen phai dat
+                       norm2.weight = 2 * gamma * sigma_b de
+                       0.5 (cong ESE luc init) * weight * 1 = gamma * sigma_b
         """
         dw = src.depthwise_conv.weight.data
         lnw, lnb = src.layer_norm.weight.data, src.layer_norm.bias.data
@@ -883,19 +944,23 @@ class DINOv3ConvNeXtBackbone(nn.Module):
 
         if idx is None:
             dst.depthwise_conv.weight.data.copy_(dw)
+            dst.depthwise_conv.bias.data.copy_(src.depthwise_conv.bias.data)
             dst.norm.weight.data.copy_(lnw)
             dst.norm.bias.data.copy_(lnb)
             dst.pointwise_conv1.weight.data.copy_(p1w[:, :, None, None])
             dst.pointwise_conv1.bias.data.copy_(p1b)
             dst.pointwise_conv2.weight.data.copy_(p2w[:, :, None, None])
             dst.pointwise_conv2.bias.data.copy_(p2b)
-            dst.norm2.weight.data.copy_(2.0 * gam)
-            dst.norm2.bias.data.zero_()
+            if dst.gamma is not None:
+                dst.gamma.data.copy_(gam)
+            else:
+                dst.norm2.weight.data.copy_(2.0 * gam * dst.sigma_b)
+                dst.norm2.bias.data.zero_()
             return
 
         k = int(idx.numel())
         dst.depthwise_conv.weight.data.copy_(dw.index_select(0, idx))
-        dst.depthwise_conv.bias.data.zero_()
+        dst.depthwise_conv.bias.data.copy_(src.depthwise_conv.bias.data.index_select(0, idx))
         dst.norm.weight.data.copy_(lnw.index_select(0, idx))
         dst.norm.bias.data.copy_(lnb.index_select(0, idx))
         # Don vi an: giu 4k don vi quan trong nhat theo ||pw1 row|| * ||pw2 col||
@@ -909,8 +974,11 @@ class DINOv3ConvNeXtBackbone(nn.Module):
             p2w.index_select(0, idx).index_select(1, hid)[:, :, None, None]
         )
         dst.pointwise_conv2.bias.data.copy_(p2b.index_select(0, idx))
-        dst.norm2.weight.data.copy_(2.0 * gam.index_select(0, idx))
-        dst.norm2.bias.data.zero_()
+        if dst.gamma is not None:
+            dst.gamma.data.copy_(gam.index_select(0, idx))
+        else:
+            dst.norm2.weight.data.copy_(2.0 * gam.index_select(0, idx) * dst.sigma_b)
+            dst.norm2.bias.data.zero_()
 
     @staticmethod
     def _stage_channel_index_(src_stage, keep: int) -> torch.Tensor:
@@ -972,8 +1040,10 @@ class DINOv3ConvNeXtBackbone(nn.Module):
         # --- E-ConvNeXt: stem vb + CSPStage cho stages[0..1], E cho toan mang ---
         # stem vb tong stride 2 -> 64 @112x112; CSPStage.down lo nua stride con lai.
         self.stem = EConvNeXtStem(out_channels=64)
-        self.stage1 = CSPStage(64, 96, num_blocks=3, stride=2, use_ese=True)
-        self.stage2 = CSPStage(96, 192, num_blocks=3, stride=2, use_ese=True)
+        self.stage1 = CSPStage(64, 96, num_blocks=3, stride=2, use_ese=True,
+                               sigma_b=SIGMA_B[0])
+        self.stage2 = CSPStage(96, 192, num_blocks=3, stride=2, use_ese=True,
+                               sigma_b=SIGMA_B[1])
         self.stage3 = EConvNeXtStage(192, 384, num_blocks=27, use_ese=False)
         self.stage4 = EConvNeXtStage(384, 768, num_blocks=3, use_ese=False)
 
