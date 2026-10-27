@@ -147,6 +147,8 @@ Preprocessing protocol (VRU + VRAI):
 - `--no-fp16-sim`: disable bf16/fp16 similarity matmul during evaluation.
 - `--eval-verbose`: print progress while evaluating `Big` split.
 - `--eval-split-seed`: seed for the random gallery pick per identity (default `42`).
+- `--save-path`: checkpoint path. Its directory also receives `log.txt` by default.
+- `--log-path`: override the log file path (default `<dir of --save-path>/log.txt`).
 - `--save-best` / `--no-save-best`: enable/disable saving `*.best.pth` when eval runs (enabled by default with `--run-eval`).
 - `--best-metric`: metric for best checkpoint selection (`big_map` default, `medium_map`, `small_map`).
 - `--gate {bcgg,rga}`: stage gate block. Default `bcgg` (new); use `rga` for the legacy block/checkpoints.
@@ -189,10 +191,13 @@ Default checkpoint path inside container:
 
 - `/workspace/output/gasnet_vru.pth`
 - `/workspace/output/gasnet_vru.best.pth` (best checkpoint, when `--run-eval` and best saving is enabled)
+- `/workspace/output/log.txt` (full stdout/stderr of the run; appended, one header per run)
 
-Evaluation metrics are printed to stdout/stderr (redirect logs if you want to persist them to a file).
+Evaluation metrics are printed to stdout/stderr and are also written to
+`log.txt` in the same directory as `--save-path` (append mode; each run starts with a
+timestamp + full command header). Use `--log-path` to write the log elsewhere.
 
-Because `/workspace/output` is mounted to host, checkpoints and redirected logs remain on host after container exits.
+Because `/workspace/output` is mounted to host, checkpoints and logs remain on host after container exits.
 
 ## 10) Export ONNX → TensorRT
 

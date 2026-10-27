@@ -139,6 +139,10 @@ class Logger(object):
         self.stream.flush()
         self.log.flush()
 
+    def __getattr__(self, name):
+        # isatty/encoding/fileno/... are delegated to the original stream.
+        return getattr(self.stream, name)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train GASNet on VRU")
@@ -154,7 +158,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-pin-memory", action="store_true")
     parser.add_argument("--no-persistent-workers", action="store_true")
     parser.add_argument("--save-path", type=Path, default=Path("/workspace/output/gasnet_vru.pth"))
-    parser.add_argument("--log-path", type=Path, default=None, help="Path to save log text file")
+    parser.add_argument(
+        "--log-path",
+        type=Path,
+        default=None,
+        help="Path to save log text file (default: log.txt in the --save-path directory)",
+    )
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-eval", action="store_true", help="Run retrieval evaluation on Small/Medium/Big test splits")
@@ -1772,10 +1781,20 @@ def _save_attention_local_visualization(
 
 def main() -> None:
     args = parse_args()
-    if args.log_path:
-        args.log_path.parent.mkdir(parents=True, exist_ok=True)
-        sys.stdout = Logger(args.log_path, sys.stdout)
-        sys.stderr = Logger(args.log_path, sys.stderr)
+    # Log to log.txt next to the checkpoint unless --log-path overrides it.
+    log_path = args.log_path or (args.save_path.parent / "log.txt")
+    args.log_path = log_path
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        sys.stdout = Logger(log_path, sys.stdout)
+        sys.stderr = Logger(log_path, sys.stderr)
+    except OSError as exc:
+        print(f"[WARN] Không mở được log {log_path}: {exc}. Tiếp tục chạy không ghi log file.")
+    else:
+        print(f"=> Log: {log_path}")
+        print("=" * 72)
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {sys.executable} {' '.join(sys.argv)}")
+        print("=" * 72)
 
     set_seed(args.seed)
     configure_cuda_for_speed()
