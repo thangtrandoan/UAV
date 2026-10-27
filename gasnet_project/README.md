@@ -117,10 +117,11 @@ For each subset, it prints:
 
 For the `Big` split, evaluation now runs in query chunks instead of materializing a full query×gallery matrix. This reduces peak memory and avoids long "no output" periods. Enable `--eval-verbose` to print chunk progress.
 
-Evaluation protocol (VRU):
+Preprocessing protocol (VRU + VRAI):
 
-- Test images are resized **directly to 224×224** (no 256×256 resize + center crop),
-  matching inference (`infer.py`, `infer_trt.py`).
+- Training and test images are both resized **directly to 224×224** (no 256×256
+  resize + crop), matching inference (`infer.py`, `infer_trt.py`) and the
+  TensorRT export.
 - For each identity, **one gallery image is picked at random** instead of always the
   lowest `image_id` (first frame); the remaining images are queries. The split is
   reproducible: `--eval-split-seed` (default `42`). Change the seed to draw a

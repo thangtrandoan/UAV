@@ -1833,7 +1833,7 @@ def main() -> None:
 
     if args.strong_aug:
         train_tfms = transforms.Compose([
-            transforms.Resize((256, 256)),
+            # transforms.Resize((224,224)),
             transforms.RandomResizedCrop((224, 224), scale=(0.75, 1.0), ratio=(0.85, 1.15)),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomApply([transforms.RandomRotation(degrees=12)], p=0.35),
@@ -1850,9 +1850,9 @@ def main() -> None:
         ])
     else:
         train_tfms = transforms.Compose([
-            transforms.Resize((256, 256)),
+            transforms.Resize((224, 224)),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomCrop((224, 224)),
+            # transforms.RandomCrop((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
