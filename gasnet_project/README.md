@@ -117,6 +117,17 @@ For each subset, it prints:
 
 For the `Big` split, evaluation now runs in query chunks instead of materializing a full query×gallery matrix. This reduces peak memory and avoids long "no output" periods. Enable `--eval-verbose` to print chunk progress.
 
+Evaluation protocol (VRU):
+
+- Test images are resized **directly to 224×224** (no 256×256 resize + center crop),
+  matching inference (`infer.py`, `infer_trt.py`).
+- For each identity, **one gallery image is picked at random** instead of always the
+  lowest `image_id` (first frame); the remaining images are queries. The split is
+  reproducible: `--eval-split-seed` (default `42`). Change the seed to draw a
+  different gallery set.
+- Both changes shift mAP/Rank-1, so numbers are not directly comparable with runs
+  made before this protocol change.
+
 ## 7) Important Arguments
 
 - `--run-eval`: enable evaluation.
@@ -134,6 +145,7 @@ For the `Big` split, evaluation now runs in query chunks instead of materializin
 - `--eval-q-chunk-size`: query block size used by chunked retrieval evaluation (default `2048`).
 - `--no-fp16-sim`: disable bf16/fp16 similarity matmul during evaluation.
 - `--eval-verbose`: print progress while evaluating `Big` split.
+- `--eval-split-seed`: seed for the random gallery pick per identity (default `42`).
 - `--save-best` / `--no-save-best`: enable/disable saving `*.best.pth` when eval runs (enabled by default with `--run-eval`).
 - `--best-metric`: metric for best checkpoint selection (`big_map` default, `medium_map`, `small_map`).
 - `--gate {bcgg,rga}`: stage gate block. Default `bcgg` (new); use `rga` for the legacy block/checkpoints.
@@ -165,9 +177,10 @@ Key properties:
 - **Not checkpoint-compatible with RGA**: the gate parameters differ, so switching a
   trained model requires retraining (RGA stays available for reproducing old runs).
 
-`evaluate_vrai.py`, `infer.py` and `export_onnx.py` auto-detect the gate type (and the
-BCGG hyper-parameters) from the checkpoint, so old RGA checkpoints still load unchanged.
-Attention heatmaps work for both blocks.
+`evaluate_vrai.py`, `infer.py` and `export_onnx.py` auto-detect the backbone, the gate
+type and the BCGG hyper-parameters from the checkpoint, so old RGA checkpoints still
+load unchanged (a `[WARN]` is printed if many tensors do not match). Attention heatmaps
+work for both blocks.
 
 ## 9) Outputs
 
@@ -180,7 +193,51 @@ Evaluation metrics are printed to stdout/stderr (redirect logs if you want to pe
 
 Because `/workspace/output` is mounted to host, checkpoints and redirected logs remain on host after container exits.
 
-## 10) Quick Handoff Checklist
+## 10) Export ONNX → TensorRT
+
+**Bước 1 — export ONNX** trên máy có `transformers` + checkpoint (ví dụ Colab đã train).
+Backbone DINOv3 cần `transformers` và HF config, nên export trên Jetson offline dễ lỗi;
+hãy export ở Colab rồi copy file `.onnx` sang Jetson.
+
+```bash
+python export_onnx.py \
+  --checkpoint /content/drive/MyDrive/ReID_Research/results/gasnet_convnext_bcgg.pth \
+  --output /content/gasnet_convnext_bcgg.onnx
+```
+
+Script tự nhận diện `backbone=dinov3_convnext`, `gate=bcgg`, `num_classes`; mặc định
+`--deploy` fold Conv+BN và RepDW; `--verify` so ONNX với PyTorch qua onnxruntime
+(nếu chưa cài: `pip install onnxruntime`). Output kỳ vọng: `output_0 [1,2048]`,
+`output_1 [1,512]`, và in sẵn lệnh `trtexec`.
+
+**Bước 2 — build engine trên chính Jetson** (engine gắn với thiết bị + phiên bản TensorRT,
+không copy engine giữa các máy):
+
+```bash
+/usr/src/tensorrt/bin/trtexec \
+  --onnx=gasnet_convnext_bcgg.onnx \
+  --saveEngine=gasnet_convnext_bcgg_fp16.engine \
+  --fp16 --memPoolSize=workspace:4096
+# TensorRT 8.x: dùng --workspace=4096 thay vì --memPoolSize=workspace:4096
+```
+
+**Bước 3 — chạy inference** (engine batch 1, input NCHW `1x3x224x224`, đã normalize):
+
+```bash
+python infer_trt.py \
+  --engine test/gasnet_convnext_bcgg_fp16.engine \
+  --image-dir test/test_image \
+  --output-dir test/output
+```
+
+Lưu ý:
+
+- Engine chỉ dùng đúng batch/độ phân giải đã export (hiện là batch 1, 224×224).
+- `infer_trt.py` dùng API TensorRT 8.x; TensorRT 10 đổi API binding, cần cập nhật script.
+- Muốn thử opset mới hơn: `--opset 17` (LayerNorm native, có thể nhanh hơn trên TRT mới),
+  nhưng luôn build thử engine và đo lại trước khi dùng.
+
+## 11) Quick Handoff Checklist
 
 - Image pulled successfully: `trandoanthang/gasnet-h100:v2` (or local build `gasnet-h100:v2`)
 - Dataset mount path contains `VRU/Pic` and `VRU/train_test_split`

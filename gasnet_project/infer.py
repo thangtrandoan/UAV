@@ -8,7 +8,7 @@ from PIL import Image
 
 # Import trực tiếp class GASNet từ file train.py có sẵn trong thư mục
 from bcgg import infer_gate_config
-from train import GASNet
+from train import GASNet, infer_backbone_name
 from utils import normalize_state_dict
 
 def count_parameters(model):
@@ -75,12 +75,13 @@ def main():
 
     # Tự nhận diện RGA hay BCGG (và siêu tham số BCGG) từ checkpoint.
     gate_config = infer_gate_config(loaded_state_dict or {})
-    print(f"=> Gate block: {gate_config['gate']}")
+    backbone = infer_backbone_name(loaded_state_dict or {}, default="resnet50_ibn")
+    print(f"=> Backbone: {backbone}, gate: {gate_config['gate']}")
 
     model = GASNet(
         num_classes=6302,
         use_pretrained=False,
-        backbone="resnet50_ibn",
+        backbone=backbone,
         use_gem=True,
         **gate_config,
     )
@@ -92,7 +93,7 @@ def main():
             if k in model_state and v.shape == model_state[k].shape
         }
         model.load_state_dict(filtered, strict=False)
-        print("=> Nạp trọng số THÀNH CÔNG!")
+        print(f"=> Nạp trọng số THÀNH CÔNG ({len(filtered)}/{len(model_state)} tensors)!")
     else:
         print(f"[CẢNH BÁO] Không tìm thấy file: {model_path}")
         print("=> Đang dùng trọng số Khởi tạo ngẫu nhiên (Random Init)!")
@@ -107,8 +108,7 @@ def main():
         print(f"=> Đã fold BN/RepDW (deploy): {count_parameters(model):,} tham số")
     
     test_tfms = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.CenterCrop((224, 224)),
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])

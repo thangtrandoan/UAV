@@ -18,7 +18,7 @@ from torchvision import transforms
 
 import sys
 from bcgg import infer_gate_config
-from train import GASNet, Logger
+from train import GASNet, Logger, infer_backbone_name
 from utils import choose_amp_dtype, configure_cuda_for_speed, evaluate_map_cmc, normalize_state_dict
 
 
@@ -811,22 +811,20 @@ def _prepare_display_image(path: Path, size: int = 224, d_parts: list = None) ->
     with Image.open(path) as img:
         img_rgb = img.convert("RGB")
         orig_w, orig_h = img_rgb.size
-        img_resized = img_rgb.resize((256, 256), Image.BILINEAR)
-        
+        img_resized = img_rgb.resize((size, size), Image.BILINEAR)
+
         if d_parts:
             draw = ImageDraw.Draw(img_resized)
             for part in d_parts:
                 if len(part) == 2 and len(part[0]) == 2 and len(part[1]) == 2:
                     (x1, y1), (x2, y2) = part
-                    x1_s = int(x1 * 256 / orig_w)
-                    y1_s = int(y1 * 256 / orig_h)
-                    x2_s = int(x2 * 256 / orig_w)
-                    y2_s = int(y2 * 256 / orig_h)
+                    x1_s = int(x1 * size / orig_w)
+                    y1_s = int(y1 * size / orig_h)
+                    x2_s = int(x2 * size / orig_w)
+                    y2_s = int(y2 * size / orig_h)
                     draw.rectangle([x1_s, y1_s, x2_s, y2_s], outline=(255, 255, 0), width=2)
-                    
-    left = (img_resized.width - size) // 2
-    top = (img_resized.height - size) // 2
-    return img_resized.crop((left, top, left + size, top + size)).convert("RGB")
+
+    return img_resized.convert("RGB")
 
 
 def _draw_label(draw: ImageDraw.ImageDraw, xy: Tuple[int, int], text: str, fill: Tuple[int, int, int]) -> None:
@@ -1183,7 +1181,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gem-p", type=float, default=3.0, help="GeM pooling exponent")
     parser.add_argument("--backbone", choices=[
         "resnet50", "resnet50_ibn", "swin_t", "dinov3_convnext"
-    ], default="resnet50")
+    ], default=None, help="Backbone; default auto-detects from the checkpoint")
     parser.add_argument(
         "--gate",
         choices=("bcgg", "rga"),
@@ -1298,8 +1296,7 @@ def main() -> None:
 
     test_tfms = transforms.Compose(
         [
-            transforms.Resize((256, 256)),
-            transforms.CenterCrop((224, 224)),
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
@@ -1318,6 +1315,8 @@ def main() -> None:
     gate_config = infer_gate_config(state_dict)
     if args.gate is not None:
         gate_config["gate"] = args.gate
+    backbone = args.backbone or infer_backbone_name(state_dict, default="resnet50")
+    print(f"=> Backbone: {backbone}, gate: {gate_config['gate']}")
     model = GASNet(
         num_classes=num_classes,
         use_pretrained=False,
@@ -1325,7 +1324,7 @@ def main() -> None:
         num_parts=args.num_parts,
         use_gem=args.use_gem,
         gem_p=args.gem_p,
-        backbone=args.backbone,
+        backbone=backbone,
         use_attention_local=args.use_attention_local,
         num_attention_heads=args.num_attention_heads,
         **gate_config,
@@ -1335,6 +1334,13 @@ def main() -> None:
     model_state = model.state_dict()
     filtered_state = {k: v for k, v in state_dict.items() if k in model_state and v.shape == model_state[k].shape}
     model.load_state_dict(filtered_state, strict=False)
+    loaded, total = len(filtered_state), len(model_state)
+    print(f"=> Loaded {loaded}/{total} tensors from checkpoint")
+    if loaded < 0.9 * total:
+        print(
+            "[WARN] Many checkpoint tensors did not match the model. "
+            "Check --backbone/--gate and branch flags (--use-gem, --use-part-branch, ...)."
+        )
     model.eval()
 
     if is_centroid:

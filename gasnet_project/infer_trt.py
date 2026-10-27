@@ -18,16 +18,11 @@ MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
 STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
 
 def preprocess(img_path):
-    """Đọc ảnh, resize, center-crop, normalize → numpy (1, 3, 224, 224) float32"""
+    """Đọc ảnh, resize thẳng 224x224, normalize → numpy (1, 3, 224, 224) float32"""
     img = Image.open(img_path).convert("RGB")
-    
-    # Resize về 256x256
-    img = img.resize((256, 256), Image.BILINEAR)
-    
-    # Center crop 224x224
-    left = (256 - 224) // 2   # = 16
-    top  = (256 - 224) // 2   # = 16
-    img = img.crop((left, top, left + 224, top + 224))
+
+    # Resize thẳng về 224x224 (không center-crop)
+    img = img.resize((224, 224), Image.BILINEAR)
     
     # Chuyển sang numpy float32, scale về [0, 1], rồi chuẩn hoá
     arr = np.array(img, dtype=np.float32) / 255.0   # (224, 224, 3)
@@ -38,105 +33,112 @@ def preprocess(img_path):
 
 
 # =============================================
-# TensorRT Model Wrapper
+# TensorRT Model Wrapper (hỗ trợ TRT 8.x và 10.x)
 # =============================================
+TRT_MAJOR = int(trt.__version__.split(".")[0])
+
+
 class TRTModel:
     def __init__(self, engine_path):
-        print(f"Đang nạp file TensorRT Engine từ {engine_path}...")
+        print(f"Đang nạp TensorRT Engine: {engine_path} (TensorRT {trt.__version__})...")
         with open(engine_path, "rb") as f:
             runtime = trt.Runtime(TRT_LOGGER)
             self.engine = runtime.deserialize_cuda_engine(f.read())
-            
+        if self.engine is None:
+            raise RuntimeError(
+                "Không deserialize được engine. Engine phải được build trên đúng máy này "
+                "và đúng phiên bản TensorRT."
+            )
+
         self.context = self.engine.create_execution_context()
-        
-        # Cấp phát bộ nhớ cho Input và Output
+        self.stream = cuda.Stream()
         self.inputs = []
         self.outputs = []
-        self.bindings = []
-        self.stream = cuda.Stream()
-        
-        num_bindings = self.engine.num_bindings
-        print(f"Engine có {num_bindings} binding(s):")
-        
-        for i in range(num_bindings):
+        self.bindings = []  # chỉ dùng cho API cũ (TRT < 10)
+
+        if TRT_MAJOR >= 10:
+            self._init_trt10()
+        else:
+            self._init_legacy()
+
+    def _init_trt10(self):
+        print(f"Engine có {self.engine.num_io_tensors} tensor I/O:")
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            is_input = self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+            shape = tuple(self.engine.get_tensor_shape(name))
+            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+            self._add_tensor(name, shape, dtype, is_input)
+
+    def _init_legacy(self):
+        print(f"Engine có {self.engine.num_bindings} binding(s):")
+        for i in range(self.engine.num_bindings):
             name = self.engine.get_binding_name(i)
-            shape = self.engine.get_binding_shape(i)
-            dtype = trt.nptype(self.engine.get_binding_dtype(i))
             is_input = self.engine.binding_is_input(i)
-            
-            # Tính kích thước bộ nhớ cần cấp
-            size = 1
-            for s in shape:
-                size *= abs(s)  # abs() phòng trường hợp dimension = -1
-            
-            # Cấp phát bộ nhớ RAM (Host) và VRAM (Device)
-            host_mem = cuda.pagelocked_empty(size, dtype)
-            device_mem = cuda.mem_alloc(host_mem.nbytes)
-            
-            self.bindings.append(int(device_mem))
-            
-            binding_info = {
-                'host': host_mem,
-                'device': device_mem,
-                'shape': tuple(shape),
-                'name': name,
-                'dtype': dtype
-            }
-            
-            if is_input:
-                self.inputs.append(binding_info)
-                print(f"  [INPUT]  {name}: shape={shape}, dtype={dtype}")
-            else:
-                self.outputs.append(binding_info)
-                print(f"  [OUTPUT] {name}: shape={shape}, dtype={dtype}")
+            shape = tuple(self.engine.get_binding_shape(i))
+            dtype = trt.nptype(self.engine.get_binding_dtype(i))
+            info = self._add_tensor(name, shape, dtype, is_input)
+            self.bindings.append(int(info["device"]))
+
+    def _add_tensor(self, name, shape, dtype, is_input):
+        size = int(np.prod(shape)) if len(shape) else 1
+        host = cuda.pagelocked_empty(size, dtype)
+        device = cuda.mem_alloc(host.nbytes)
+        info = {"name": name, "host": host, "device": device, "shape": shape, "dtype": dtype}
+        (self.inputs if is_input else self.outputs).append(info)
+        tag = "INPUT " if is_input else "OUTPUT"
+        print(f"  [{tag}] {name}: shape={list(shape)}, dtype={np.dtype(dtype).name}")
+        return info
 
     def infer(self, input_np):
-        """Chạy inference với input numpy array, trả về list các output numpy arrays."""
-        # Copy input vào host memory
-        np.copyto(self.inputs[0]['host'], input_np.ravel())
-        
-        # Chuyển dữ liệu từ RAM sang VRAM (CPU -> GPU)
+        """Chạy inference với input numpy (1,3,224,224), trả về list output numpy."""
+        np.copyto(self.inputs[0]["host"], input_np.ravel())
         for inp in self.inputs:
-            cuda.memcpy_htod_async(inp['device'], inp['host'], self.stream)
-        
-        # Chạy Inference trên GPU
-        self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
-        
-        # Chuyển dữ liệu kết quả từ VRAM về RAM (GPU -> CPU)
+            cuda.memcpy_htod_async(inp["device"], inp["host"], self.stream)
+
+        if TRT_MAJOR >= 10:
+            for tensor in self.inputs + self.outputs:
+                self.context.set_tensor_address(tensor["name"], int(tensor["device"]))
+            ok = self.context.execute_async_v3(stream_handle=self.stream.handle)
+        else:
+            ok = self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
+        if not ok:
+            raise RuntimeError("TensorRT execute_async thất bại.")
+
         for out in self.outputs:
-            cuda.memcpy_dtoh_async(out['host'], out['device'], self.stream)
-            
-        # Đồng bộ hoá
+            cuda.memcpy_dtoh_async(out["host"], out["device"], self.stream)
         self.stream.synchronize()
-        
-        # Trả về tất cả các output
-        results = []
-        for out in self.outputs:
-            result = np.copy(out['host'])  # Copy ra để an toàn
-            result = result.reshape(out['shape'])
-            results.append(result)
-        
-        return results
+
+        return [np.copy(out["host"]).reshape(out["shape"]) for out in self.outputs]
 
 
 # =============================================
 # Main
 # =============================================
 def main():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     parser = argparse.ArgumentParser(description="GASNet TensorRT Inference")
+    parser.add_argument("--engine", default=os.path.join(base_dir, "test", "gasnet_fp16.engine"),
+                        help="Đường dẫn file .engine đã build")
+    parser.add_argument("--image-dir", default=os.path.join(base_dir, "test", "test_image"),
+                        help="Thư mục ảnh đầu vào")
+    parser.add_argument("--output-dir", default=os.path.join(base_dir, "test", "output"),
+                        help="Thư mục lưu report")
+    parser.add_argument("--warmup", type=int, default=10, help="Số vòng warmup")
     args = parser.parse_args()
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    test_img_dir = os.path.join(base_dir, "test", "test_image")
-    output_dir = os.path.join(base_dir, "test", "output")
-    engine_path = os.path.join(base_dir, "test", "gasnet_fp16.engine")
+    test_img_dir = args.image_dir
+    output_dir = args.output_dir
+    engine_path = args.engine
     
     os.makedirs(output_dir, exist_ok=True)
     
     if not os.path.exists(engine_path):
+        engine_name = os.path.basename(engine_path)
         print(f"[LỖI] Không tìm thấy file: {engine_path}")
-        print("Bạn cần build Engine trước bằng lệnh:")
-        print(f"  /usr/src/tensorrt/bin/trtexec --onnx=gasnet.onnx --saveEngine=gasnet_fp16.engine --fp16 --workspace=4096")
+        print("Bạn cần build Engine trước bằng lệnh (chạy trên chính thiết bị này):")
+        pool = "--workspace=4096" if TRT_MAJOR < 9 else "--memPoolSize=workspace:4096"
+        print(f"  /usr/src/tensorrt/bin/trtexec --onnx=gasnet.onnx --saveEngine={engine_name} --fp16 {pool}")
         return
 
     # Nạp TensorRT Engine
@@ -154,10 +156,10 @@ def main():
     
     print(f"\nBắt đầu TensorRT Inference cho {len(img_files)} ảnh...")
     
-    # Warmup: Chạy 10 vòng để GPU ổn định tần số và cache
-    print("Đang chạy warmup TensorRT (10 vòng)...")
+    # Warmup: Chạy vài vòng để GPU ổn định tần số và cache
+    print(f"Đang chạy warmup TensorRT ({args.warmup} vòng)...")
     dummy_input = np.zeros((1, 3, 224, 224), dtype=np.float32)
-    for _ in range(10):
+    for _ in range(max(0, args.warmup)):
         model.infer(dummy_input)
         
     # Inference thật

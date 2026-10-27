@@ -205,6 +205,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-rerank-k1", type=int, default=20)
     parser.add_argument("--eval-rerank-alpha", type=float, default=0.3)
     parser.add_argument("--eval-tta-flip", action="store_true", help="Average original and horizontal-flip features during VRU evaluation")
+    parser.add_argument(
+        "--eval-split-seed",
+        type=int,
+        default=42,
+        help="Seed for picking the random gallery image per identity during VRU evaluation",
+    )
     parser.add_argument("--strong-aug", action="store_true", help="Use stronger domain-randomization augmentation for training")
     parser.add_argument("--pk-k", type=int, default=4, help="Images per identity in PK sampler")
     parser.add_argument("--use-gem", action="store_true", help="Use GeM pooling instead of average pooling")
@@ -413,6 +419,20 @@ def _make_gate_block(
             inject_value=inject_value,
         )
     raise ValueError(f"Unsupported gate kind: {kind!r} (expected 'bcgg' or 'rga')")
+
+
+def infer_backbone_name(state_dict: dict, default: str = "resnet50") -> str:
+    """Detect the backbone from checkpoint keys (see ``infer_gate_config``)."""
+    keys = state_dict.keys()
+    if any(k.startswith("convnext_backbone.") for k in keys):
+        return "dinov3_convnext"
+    if any(k.startswith("swin_backbone.") for k in keys):
+        return "swin_t"
+    if any(".bn1.in_norm." in k for k in keys):
+        return "resnet50_ibn"
+    if any(k.startswith("layer1.") for k in keys):
+        return "resnet50"
+    return default
 
 
 class Lite3x3(nn.Module):
@@ -1837,8 +1857,7 @@ def main() -> None:
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
     test_tfms = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.CenterCrop((224, 224)),
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
@@ -2129,6 +2148,7 @@ def main() -> None:
                 rerank_k1=args.eval_rerank_k1,
                 rerank_alpha=args.eval_rerank_alpha,
                 tta_flip=args.eval_tta_flip,
+                split_seed=args.eval_split_seed,
             )
             print_eval_report(metrics, title=f"Evaluation @ Epoch {epoch}")
             if save_best:
@@ -2165,6 +2185,7 @@ def main() -> None:
             rerank_k1=args.eval_rerank_k1,
             rerank_alpha=args.eval_rerank_alpha,
             tta_flip=args.eval_tta_flip,
+            split_seed=args.eval_split_seed,
         )
         print_eval_report(metrics, title="Final Evaluation")
         if save_best:

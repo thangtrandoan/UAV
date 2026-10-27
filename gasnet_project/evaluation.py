@@ -148,6 +148,7 @@ def run_eval(
     rerank_k1: int = 20,
     rerank_alpha: float = 0.3,
     tta_flip: bool = False,
+    split_seed: int | None = 42,
 ) -> Dict[str, Tuple[float, float, float]]:
     vru_dir = data_root / "VRU"
     pic_dir = vru_dir / "Pic"
@@ -160,7 +161,7 @@ def run_eval(
 
     for split_name, split_file in SPLIT_FILE_MAP.items():
         test_samples = read_split_file(pic_dir, split_dir / split_file)
-        query_samples, gallery_samples = build_query_gallery(test_samples)
+        query_samples, gallery_samples = build_query_gallery(test_samples, seed=split_seed)
 
         q_loader = _make_eval_loader(
             query_samples,
