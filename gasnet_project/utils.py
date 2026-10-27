@@ -32,6 +32,22 @@ def choose_amp_dtype() -> torch.dtype:
     return torch.float16
 
 
+def normalize_state_dict(state_dict: dict) -> dict:
+    """Strip DataParallel / torch.compile wrapper prefixes from checkpoint keys.
+
+    Training saves the compiled module's state dict when ``torch.compile`` is
+    enabled, which prefixes every key with ``_orig_mod.``. Stripping the prefix
+    keeps checkpoints loadable by every script.
+    """
+    if not state_dict:
+        return state_dict
+    out = state_dict
+    for prefix in ("module.", "_orig_mod."):
+        if out and all(key.startswith(prefix) for key in out):
+            out = {key[len(prefix):]: value for key, value in out.items()}
+    return out
+
+
 @torch.no_grad()
 def evaluate_map_cmc(
     query_feats: torch.Tensor,

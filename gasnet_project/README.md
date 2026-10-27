@@ -136,8 +136,40 @@ For the `Big` split, evaluation now runs in query chunks instead of materializin
 - `--eval-verbose`: print progress while evaluating `Big` split.
 - `--save-best` / `--no-save-best`: enable/disable saving `*.best.pth` when eval runs (enabled by default with `--run-eval`).
 - `--best-metric`: metric for best checkpoint selection (`big_map` default, `medium_map`, `small_map`).
+- `--gate {bcgg,rga}`: stage gate block. Default `bcgg` (new); use `rga` for the legacy block/checkpoints.
+- `--gate-hidden` (default `16`), `--gate-groups` (default `4`), `--gate-kernel` (default `7`), `--gate-channel-kernel` (default `5`): BCGG shape controls.
+- `--gate-inject-value`: BCGG ablation that adds the `P_value(u)` additive refinement branch.
 
-## 8) Outputs
+## 8) Stage gate: BCGG vs RGA
+
+`bcgg.py` implements **Bottleneck Context Group Gate** (a research proposal, not a
+published module). It replaces the `RGABlock` interleaved after every backbone stage:
+
+```text
+x ──► spatial: 1x1 Conv-BN-ReLU (C→d) → RepDW 7x7 (d) → 1x1 Conv (d→G) → [B,G,1,H,W]
+  └─► channel: GAP → Conv1d over channel axis (k=5) → [B,C] → [B,G,C/G,1,1]
+gate = 2 * sigmoid(channel + spatial);  y = x * gate
+```
+
+Key properties:
+
+- **Identity at init**: both logit heads are zero-initialised, so `gate = 2*sigmoid(0) = 1`
+  and the block changes nothing until it learns. Safe to interleave with pretrained stages.
+- **Cheap**: the gate params are ~66k for ResNet-50 vs ~14.6M for the 4 RGA blocks,
+  and it never builds the `N x N` relation matrices (`N = H*W`) that dominate RGA.
+- **Deployable**: `GASNet.to_deploy()` (also used by `export_onnx.py`) folds Conv+BN and
+  the three RepDW branches into one depthwise conv; the exported gate sub-graph keeps a
+  single `Sigmoid` + two `Mul` and no gate `BatchNormalization`.
+- **No fixed spatial size**: unlike RGA, BCGG works at any resolution, so the
+  hard-coded `(56,56)..(7,7)` assumptions are gone (RGA still uses them).
+- **Not checkpoint-compatible with RGA**: the gate parameters differ, so switching a
+  trained model requires retraining (RGA stays available for reproducing old runs).
+
+`evaluate_vrai.py`, `infer.py` and `export_onnx.py` auto-detect the gate type (and the
+BCGG hyper-parameters) from the checkpoint, so old RGA checkpoints still load unchanged.
+Attention heatmaps work for both blocks.
+
+## 9) Outputs
 
 Default checkpoint path inside container:
 
@@ -148,7 +180,7 @@ Evaluation metrics are printed to stdout/stderr (redirect logs if you want to pe
 
 Because `/workspace/output` is mounted to host, checkpoints and redirected logs remain on host after container exits.
 
-## 9) Quick Handoff Checklist
+## 10) Quick Handoff Checklist
 
 - Image pulled successfully: `trandoanthang/gasnet-h100:v2` (or local build `gasnet-h100:v2`)
 - Dataset mount path contains `VRU/Pic` and `VRU/train_test_split`

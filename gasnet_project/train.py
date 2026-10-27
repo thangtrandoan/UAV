@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import sys
 import pickle
@@ -18,6 +19,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
 
+from bcgg import BottleneckContextGroupGate
 from dataset import VRUDataset, build_query_gallery, read_split_file
 from evaluation import print_eval_report, run_eval
 from utils import choose_amp_dtype, configure_cuda_for_speed, set_seed
@@ -174,6 +176,26 @@ def parse_args() -> argparse.Namespace:
         "--econvnext",
         action="store_true",
         help="Dung kien truc E-ConvNeXt (phuong an II) thay vi DINOv3 goc",
+    )
+    parser.add_argument(
+        "--gate",
+        choices=("bcgg", "rga"),
+        default="bcgg",
+        help="Stage gate block: bcgg (Bottleneck Context Group Gate) or legacy rga",
+    )
+    parser.add_argument("--gate-hidden", type=int, default=16, help="BCGG bottleneck width")
+    parser.add_argument("--gate-groups", type=int, default=4, help="BCGG number of channel groups")
+    parser.add_argument("--gate-kernel", type=int, default=7, help="BCGG depthwise context kernel (odd)")
+    parser.add_argument(
+        "--gate-channel-kernel",
+        type=int,
+        default=5,
+        help="BCGG 1D channel-logit kernel (odd)",
+    )
+    parser.add_argument(
+        "--gate-inject-value",
+        action="store_true",
+        help="BCGG ablation: add the P_value(u) additive refinement branch",
     )
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--eval-q-chunk-size", type=int, default=2048, help="Query chunk size for retrieval evaluation")
@@ -357,10 +379,40 @@ class RGABlock(nn.Module):
             channel_reduction=channel_reduction,
         )
 
+    @property
+    def last_attention(self) -> torch.Tensor | None:
+        """Uniform attention API shared with BottleneckContextGroupGate."""
+        return self.rga_s.last_attention
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.rga_s(x)
         x = self.rga_c(x)
         return x
+
+
+def _make_gate_block(
+    kind: str,
+    channels: int,
+    spatial_size: tuple[int, int],
+    hidden: int = 16,
+    groups: int = 4,
+    kernel_size: int = 7,
+    channel_kernel: int = 5,
+    inject_value: bool = False,
+) -> nn.Module:
+    """Build one stage gate: the legacy RGA block or the BCGG proposal."""
+    if kind == "rga":
+        return RGABlock(channels, spatial_size=spatial_size)
+    if kind == "bcgg":
+        return BottleneckContextGroupGate(
+            channels=channels,
+            hidden=hidden,
+            groups=groups,
+            kernel_size=kernel_size,
+            channel_kernel=channel_kernel,
+            inject_value=inject_value,
+        )
+    raise ValueError(f"Unsupported gate kind: {kind!r} (expected 'bcgg' or 'rga')")
 
 
 class Lite3x3(nn.Module):
@@ -1116,14 +1168,23 @@ class GASNet(nn.Module):
         use_attention_local: bool = False,
         num_attention_heads: int = 4,
         econvnext: bool = False,
+        gate: str = "bcgg",
+        gate_hidden: int = 16,
+        gate_groups: int = 4,
+        gate_kernel: int = 7,
+        gate_channel_kernel: int = 5,
+        gate_inject_value: bool = False,
     ):
         super().__init__()
         if num_parts < 1:
             raise ValueError("num_parts must be >= 1")
+        if gate not in ("bcgg", "rga"):
+            raise ValueError(f"Unsupported gate kind: {gate!r} (expected 'bcgg' or 'rga')")
         self.use_part_branch = use_part_branch
         self.use_attention_local = use_attention_local
         self.num_parts = num_parts
         self.backbone_type = backbone
+        self.gate_kind = gate
         self._is_convnext = backbone == "dinov3_convnext"
 
         if backbone == "swin_t":
@@ -1150,23 +1211,41 @@ class GASNet(nn.Module):
             c1, c2, c3, c4 = 256, 512, 1024, 2048
             dim_fs = 512
 
+        if gate == "bcgg":
+            if gate_groups <= 0 or gate_hidden <= 0:
+                raise ValueError("gate_groups and gate_hidden must be positive")
+            for stage, stage_channels in enumerate((c1, c2, c3, c4), start=1):
+                if stage_channels % gate_groups:
+                    raise ValueError(
+                        f"gate_groups={gate_groups} must divide stage {stage} "
+                        f"channels ({stage_channels})"
+                    )
+
+        gate_kwargs = dict(
+            hidden=gate_hidden,
+            groups=gate_groups,
+            kernel_size=gate_kernel,
+            channel_kernel=gate_channel_kernel,
+            inject_value=gate_inject_value,
+        )
+
         if backbone not in ("swin_t",) and not self._is_convnext:
             self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
             self.layer1 = base.layer1
             self.layer2 = base.layer2
             self.layer3 = base.layer3
             self.layer4 = base.layer4
-            self.ga1 = RGABlock(c1, spatial_size=(56, 56))
-            self.ga2 = RGABlock(c2, spatial_size=(28, 28))
-            self.ga3 = RGABlock(c3, spatial_size=(14, 14))
-            self.ga4 = RGABlock(c4, spatial_size=(7, 7))
+            self.ga1 = _make_gate_block(gate, c1, (56, 56), **gate_kwargs)
+            self.ga2 = _make_gate_block(gate, c2, (28, 28), **gate_kwargs)
+            self.ga3 = _make_gate_block(gate, c3, (14, 14), **gate_kwargs)
+            self.ga4 = _make_gate_block(gate, c4, (7, 7), **gate_kwargs)
 
-        # ConvNeXt: keep all 4 RGA blocks, identical flow to ResNet
+        # ConvNeXt: same 4 gate blocks as ResNet, identical flow
         if self._is_convnext:
-            self.ga1 = RGABlock(c1, spatial_size=(56, 56))
-            self.ga2 = RGABlock(c2, spatial_size=(28, 28))
-            self.ga3 = RGABlock(c3, spatial_size=(14, 14))
-            self.ga4 = RGABlock(c4, spatial_size=(7, 7))
+            self.ga1 = _make_gate_block(gate, c1, (56, 56), **gate_kwargs)
+            self.ga2 = _make_gate_block(gate, c2, (28, 28), **gate_kwargs)
+            self.ga3 = _make_gate_block(gate, c3, (14, 14), **gate_kwargs)
+            self.ga4 = _make_gate_block(gate, c4, (7, 7), **gate_kwargs)
 
         self.fs1 = OSBlockFS(c3, dim_fs)
         self.fs2 = OSBlockFS(dim_fs, dim_fs)
@@ -1211,17 +1290,44 @@ class GASNet(nn.Module):
         pooled = [self.gap(stripe).flatten(1) for stripe in stripes]
         return self.part_reduce(torch.cat(pooled, dim=1))
 
+    def set_attention_capture(self, enabled: bool) -> None:
+        """Toggle storing per-stage attention maps (BCGG blocks only).
+
+        RGA always records its attention, so this is a no-op for RGA blocks.
+        Must be called before the forward pass that consumes the maps.
+        """
+        for name in ("ga1", "ga2", "ga3", "ga4"):
+            block = getattr(self, name, None)
+            if block is not None and hasattr(block, "capture_attention"):
+                block.capture_attention = bool(enabled)
+                if not enabled:
+                    block.last_attention = None
+
+    @torch.no_grad()
+    def to_deploy(self) -> "GASNet":
+        """Return a deploy copy with BCGG Conv/BN and RepDW branches folded."""
+        if self.training:
+            raise ValueError("Call eval() before to_deploy(); keep a training checkpoint")
+        self.set_attention_capture(False)
+        module = copy.deepcopy(self)
+        module.eval()
+        for name in ("ga1", "ga2", "ga3", "ga4"):
+            block = getattr(module, name, None)
+            if block is not None and hasattr(block, "to_deploy"):
+                setattr(module, name, block.to_deploy())
+        return module.eval()
+
     def attention_regularization_loss(
         self,
         target_mean: float = 0.55,
         std_margin: float = 0.08,
     ) -> torch.Tensor:
-        # Swin backbone does not use RGA blocks
+        # Swin backbone does not use gate blocks
         if self.backbone_type == "swin_t":
             return next(self.parameters()).sum() * 0.0
         losses = []
         for block in (self.ga1, self.ga2, self.ga3, self.ga4):
-            attn = block.rga_s.last_attention
+            attn = getattr(block, "last_attention", None)
             if attn is None:
                 continue
             flat = attn.flatten(1)
@@ -1776,7 +1882,15 @@ def main() -> None:
         use_attention_local=args.use_attention_local,
         num_attention_heads=args.num_attention_heads,
         econvnext=args.econvnext,
+        gate=args.gate,
+        gate_hidden=args.gate_hidden,
+        gate_groups=args.gate_groups,
+        gate_kernel=args.gate_kernel,
+        gate_channel_kernel=args.gate_channel_kernel,
+        gate_inject_value=args.gate_inject_value,
     ).to(device)
+    if args.attention_reg_weight > 0:
+        model.set_attention_capture(True)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
 
@@ -1787,7 +1901,7 @@ def main() -> None:
     if use_convnext:
         # ── Discriminative LR for ConvNeXt ──
         # Backbone (pretrained DINOv3 weights) gets a low LR;
-        # Everything else (RGA, head, classifier, FS, BNNeck) get a high LR.
+        # Everything else (gate blocks, head, classifier, FS, BNNeck) get a high LR.
         backbone_lr = args.backbone_lr   # default 3e-5
         head_lr = args.head_lr           # default 3e-4
         weight_decay = args.convnext_weight_decay  # default 0.05
@@ -1869,8 +1983,15 @@ def main() -> None:
         f"part_branch={args.use_part_branch}, attention_reg_weight={args.attention_reg_weight}, "
         f"attn_local={args.use_attention_local}, attn_heads={args.num_attention_heads}, "
         f"attn_diversity_weight={args.attn_diversity_weight}, "
-        f"strong_aug={args.strong_aug}, pk_k={args.pk_k}, gem={args.use_gem}, backbone={args.backbone}"
+        f"strong_aug={args.strong_aug}, pk_k={args.pk_k}, gem={args.use_gem}, backbone={args.backbone}, "
+        f"gate={args.gate}"
     )
+    if args.gate == "bcgg":
+        print(
+            f"BCGG: hidden={args.gate_hidden}, groups={args.gate_groups}, "
+            f"kernel={args.gate_kernel}, channel_kernel={args.gate_channel_kernel}, "
+            f"inject_value={args.gate_inject_value}"
+        )
 
     model.train()
     ce_loss = nn.CrossEntropyLoss(label_smoothing=0.1)

@@ -17,8 +17,9 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 import sys
+from bcgg import infer_gate_config
 from train import GASNet, Logger
-from utils import choose_amp_dtype, configure_cuda_for_speed, evaluate_map_cmc
+from utils import choose_amp_dtype, configure_cuda_for_speed, evaluate_map_cmc, normalize_state_dict
 
 
 COLOR_NAMES = {
@@ -81,14 +82,7 @@ class VRAIDataset(Dataset):
 
 
 def _normalize_state_dict(state_dict: dict) -> dict:
-    if not state_dict:
-        return state_dict
-    out = state_dict
-    if all(k.startswith("module.") for k in out.keys()):
-        out = {k[len("module.") :]: v for k, v in out.items()}
-    if all(k.startswith("_orig_mod.") for k in out.keys()):
-        out = {k[len("_orig_mod.") :]: v for k, v in out.items()}
-    return out
+    return normalize_state_dict(state_dict)
 
 
 def _infer_num_classes(state_dict: dict) -> int:
@@ -912,7 +906,13 @@ def _save_attention_heatmaps(
         return hook
 
     for layer in layers:
-        module = getattr(model, layer).rga_s.sigmoid
+        block = getattr(model, layer)
+        # BCGG only records attention when asked to; RGA always does.
+        if hasattr(block, "capture_attention"):
+            block.capture_attention = True
+        module = getattr(block, "attn_probe", None)
+        if module is None:
+            module = block.rga_s.sigmoid
         handles.append(module.register_forward_hook(_capture_hook(layer)))
 
     autocast_kwargs = dict(device_type=device.type, enabled=(use_amp and device.type == "cuda"))
@@ -922,11 +922,19 @@ def _save_attention_heatmaps(
         model(tensor)
     for handle in handles:
         handle.remove()
+    for layer in layers:
+        block = getattr(model, layer)
+        if hasattr(block, "capture_attention"):
+            block.capture_attention = False
+            block.last_attention = None
 
     out_dir.mkdir(parents=True, exist_ok=True)
     stats = []
     for layer, attn_tensor in captured.items():
-        spatial_size = getattr(getattr(model, layer).rga_s, "spatial_size", None)
+        block = getattr(model, layer)
+        spatial_size = getattr(block, "spatial_size", None)
+        if spatial_size is None:
+            spatial_size = getattr(getattr(block, "rga_s", None), "spatial_size", None)
         attn = np.squeeze(attn_tensor[0].numpy())
         if attn.ndim == 1 and spatial_size is not None:
             expected_nodes = int(spatial_size[0] * spatial_size[1])
@@ -1176,6 +1184,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone", choices=[
         "resnet50", "resnet50_ibn", "swin_t", "dinov3_convnext"
     ], default="resnet50")
+    parser.add_argument(
+        "--gate",
+        choices=("bcgg", "rga"),
+        default=None,
+        help="Stage gate block; default auto-detects from the checkpoint",
+    )
     parser.add_argument("--tta-flip", action="store_true", help="Average original and horizontal-flip features")
     parser.add_argument("--analyze-failures", action="store_true", help="Write detailed Rank-1 failure analysis for eval mode")
     parser.add_argument("--analysis-output-dir", type=Path, default=Path("output/vrai_failure_analysis"))
@@ -1301,6 +1315,9 @@ def main() -> None:
         if args.num_classes is None:
             raise
         num_classes = args.num_classes
+    gate_config = infer_gate_config(state_dict)
+    if args.gate is not None:
+        gate_config["gate"] = args.gate
     model = GASNet(
         num_classes=num_classes,
         use_pretrained=False,
@@ -1311,6 +1328,7 @@ def main() -> None:
         backbone=args.backbone,
         use_attention_local=args.use_attention_local,
         num_attention_heads=args.num_attention_heads,
+        **gate_config,
     ).to(device)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)

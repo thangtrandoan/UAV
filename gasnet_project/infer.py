@@ -7,7 +7,9 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 
 # Import trực tiếp class GASNet từ file train.py có sẵn trong thư mục
+from bcgg import infer_gate_config
 from train import GASNet
+from utils import normalize_state_dict
 
 def count_parameters(model):
     """Đếm tổng số lượng tham số có thể huấn luyện của mô hình"""
@@ -38,6 +40,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1, help="Batch Size (tuỳ chỉnh, mặc định 1)")
     parser.add_argument("--amp", action="store_true", help="Bật Mixed Precision (FP16) để ép tốc độ x2 (Chỉ có tác dụng với GPU)")
     parser.add_argument("--tta-flip", action="store_true", help="Bật Lật ảnh ngang (TTA). Dự kiến làm tốc độ chậm đi 1 nửa")
+    parser.add_argument("--deploy", action="store_true", help="Fold BN/RepDW (BCGG) trước khi inference để chạy nhanh hơn")
     args = parser.parse_args()
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -48,43 +51,60 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     
     print("Đang khởi tạo mô hình GASNet với cấu hình từ evaluate_vrai...")
-    model = GASNet(
-        num_classes=6302, 
-        use_pretrained=False, 
-        backbone="resnet50_ibn", 
-        use_gem=True
-    )
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == 'cuda':
         torch.backends.cudnn.benchmark = True # Tối ưu hoá tốc độ convolution của cuDNN
-        
+
     model_path = os.path.join(base_dir, "test", "gasnet.best.pth")
+    loaded_state_dict = None
     if os.path.exists(model_path):
         print(f"Đang nạp trọng số từ file: {model_path}")
         checkpoint = torch.load(model_path, map_location=device)
-        
+
         if isinstance(checkpoint, dict):
             if 'model_state_dict' in checkpoint:
-                state_dict = checkpoint['model_state_dict']
+                loaded_state_dict = checkpoint['model_state_dict']
             elif 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
+                loaded_state_dict = checkpoint['state_dict']
             else:
-                state_dict = checkpoint
+                loaded_state_dict = checkpoint
         else:
-            state_dict = checkpoint
-            
-        model.load_state_dict(state_dict, strict=False)
+            loaded_state_dict = checkpoint
+        loaded_state_dict = normalize_state_dict(loaded_state_dict)
+
+    # Tự nhận diện RGA hay BCGG (và siêu tham số BCGG) từ checkpoint.
+    gate_config = infer_gate_config(loaded_state_dict or {})
+    print(f"=> Gate block: {gate_config['gate']}")
+
+    model = GASNet(
+        num_classes=6302,
+        use_pretrained=False,
+        backbone="resnet50_ibn",
+        use_gem=True,
+        **gate_config,
+    )
+
+    if loaded_state_dict is not None:
+        model_state = model.state_dict()
+        filtered = {
+            k: v for k, v in loaded_state_dict.items()
+            if k in model_state and v.shape == model_state[k].shape
+        }
+        model.load_state_dict(filtered, strict=False)
         print("=> Nạp trọng số THÀNH CÔNG!")
     else:
         print(f"[CẢNH BÁO] Không tìm thấy file: {model_path}")
         print("=> Đang dùng trọng số Khởi tạo ngẫu nhiên (Random Init)!")
-    
+
     num_params = count_parameters(model)
     print(f"Tổng số tham số: {num_params:,}")
-    
+
     model.eval()
     model = model.to(device)
+    if args.deploy:
+        model = model.to_deploy()
+        print(f"=> Đã fold BN/RepDW (deploy): {count_parameters(model):,} tham số")
     
     test_tfms = transforms.Compose([
         transforms.Resize((256, 256)),
