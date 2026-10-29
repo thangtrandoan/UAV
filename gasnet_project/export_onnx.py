@@ -96,7 +96,10 @@ def main():
     model.eval()
     if args.deploy:
         model = model.to_deploy()
-        print("=> Đã fold BN/RepDW (deploy graph)")
+        if gate_config["gate"] == "bcgg":
+            print("=> Đã fold BN/RepDW (deploy graph)")
+        else:
+            print("=> Gate rga: không có BN/RepDW để fold (deploy graph giữ nguyên)")
 
     # Tạo dummy_input với đúng shape mong đợi (Batch=1, Channels=3, H=224, W=224)
     dummy_input = torch.randn(1, 3, 224, 224, device="cpu")

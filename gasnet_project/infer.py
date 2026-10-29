@@ -78,8 +78,14 @@ def main():
     backbone = infer_backbone_name(loaded_state_dict or {}, default="resnet50_ibn")
     print(f"=> Backbone: {backbone}, gate: {gate_config['gate']}")
 
+    num_classes = 6302
+    if loaded_state_dict:
+        classifier = loaded_state_dict.get("classifier_global.weight")
+        if classifier is not None:
+            num_classes = int(classifier.shape[0])
+
     model = GASNet(
-        num_classes=6302,
+        num_classes=num_classes,
         use_pretrained=False,
         backbone=backbone,
         use_gem=True,
@@ -105,7 +111,10 @@ def main():
     model = model.to(device)
     if args.deploy:
         model = model.to_deploy()
-        print(f"=> Đã fold BN/RepDW (deploy): {count_parameters(model):,} tham số")
+        if gate_config["gate"] == "bcgg":
+            print(f"=> Đã fold BN/RepDW (deploy): {count_parameters(model):,} tham số")
+        else:
+            print(f"=> Gate rga: không có BN/RepDW để fold ({count_parameters(model):,} tham số)")
     
     test_tfms = transforms.Compose([
         transforms.Resize((224, 224)),

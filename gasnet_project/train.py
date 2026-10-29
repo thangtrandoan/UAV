@@ -19,10 +19,10 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
 
-from bcgg import BottleneckContextGroupGate
+from bcgg import BottleneckContextGroupGate, infer_gate_config
 from dataset import VRUDataset, build_query_gallery, read_split_file
 from evaluation import print_eval_report, run_eval
-from utils import choose_amp_dtype, configure_cuda_for_speed, set_seed
+from utils import choose_amp_dtype, configure_cuda_for_speed, normalize_state_dict, set_seed
 
 
 BEST_METRIC_SPLIT_PRIORITY = {
@@ -167,6 +167,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-eval", action="store_true", help="Run retrieval evaluation on Small/Medium/Big test splits")
+    parser.add_argument("--eval-only", action="store_true", help="Chỉ đánh giá --checkpoint với các cờ eval hiện tại rồi thoát (không train)")
+    parser.add_argument("--checkpoint", type=Path, default=None, help="Checkpoint cho --eval-only")
     parser.add_argument("--eval-every", type=int, default=0, help="Run evaluation every N epochs (0 = only final eval if --run-eval)")
     parser.add_argument("--save-best", dest="save_best", action="store_true", help="Save best checkpoint when evaluation runs")
     parser.add_argument("--no-save-best", dest="save_best", action="store_false", help="Disable best-checkpoint saving")
@@ -219,6 +221,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=42,
         help="Seed for picking the random gallery image per identity during VRU evaluation",
+    )
+    parser.add_argument(
+        "--eval-gallery",
+        choices=("random", "first"),
+        default="random",
+        help="Which image per identity becomes the gallery: 'random' (default) or 'first' "
+        "(legacy protocol: lowest image_id / first frame)",
+    )
+    parser.add_argument(
+        "--eval-legacy-resize",
+        action="store_true",
+        help="Legacy eval preprocessing: Resize(256) + CenterCrop(224) instead of Resize(224)",
     )
     parser.add_argument("--strong-aug", action="store_true", help="Use stronger domain-randomization augmentation for training")
     parser.add_argument("--pk-k", type=int, default=4, help="Images per identity in PK sampler")
@@ -1320,16 +1334,23 @@ class GASNet(nn.Module):
         return self.part_reduce(torch.cat(pooled, dim=1))
 
     def set_attention_capture(self, enabled: bool) -> None:
-        """Toggle storing per-stage attention maps (BCGG blocks only).
+        """Toggle storing per-stage attention maps.
 
-        RGA always records its attention, so this is a no-op for RGA blocks.
+        BCGG only records when asked to; RGA always records, so enabling is a
+        no-op for it. Disabling also drops any cached map for *both* kinds so
+        that ``to_deploy()`` never deep-copies a graph-attached tensor.
         Must be called before the forward pass that consumes the maps.
         """
         for name in ("ga1", "ga2", "ga3", "ga4"):
             block = getattr(self, name, None)
-            if block is not None and hasattr(block, "capture_attention"):
+            if block is None:
+                continue
+            if hasattr(block, "capture_attention"):
                 block.capture_attention = bool(enabled)
-                if not enabled:
+            if not enabled:
+                if hasattr(block, "rga_s"):
+                    block.rga_s.last_attention = None
+                elif hasattr(block, "last_attention"):
                     block.last_attention = None
 
     @torch.no_grad()
@@ -1779,6 +1800,83 @@ def _save_attention_local_visualization(
         base_model.train()
 
 
+def _build_test_tfms(legacy_resize: bool):
+    """Eval transform: direct 224 resize (default) or legacy 256 + center crop."""
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    if legacy_resize:
+        return transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.CenterCrop((224, 224)),
+            transforms.ToTensor(),
+            normalize,
+        ])
+    return transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        normalize,
+    ])
+
+
+def _run_eval_only(args: argparse.Namespace) -> None:
+    """Evaluate a saved checkpoint with exactly the current eval flags."""
+    if args.checkpoint is None:
+        raise SystemExit("--eval-only cần --checkpoint <path>")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    state = normalize_state_dict(torch.load(args.checkpoint, map_location="cpu"))
+    gate_config = infer_gate_config(state)
+    backbone = infer_backbone_name(state, default=args.backbone)
+    classifier = state.get("classifier_global.weight")
+    num_classes = int(classifier.shape[0]) if classifier is not None else 6302
+    print(
+        f"=> eval-only | checkpoint={args.checkpoint} | backbone={backbone} | "
+        f"gate={gate_config['gate']} | num_classes={num_classes} | use_gem={args.use_gem}"
+    )
+
+    model = GASNet(
+        num_classes=num_classes,
+        use_pretrained=False,
+        backbone=backbone,
+        use_gem=args.use_gem,
+        **gate_config,
+    )
+    model_state = model.state_dict()
+    filtered = {
+        k: v for k, v in state.items()
+        if k in model_state and model_state[k].shape == v.shape
+    }
+    model.load_state_dict(filtered, strict=False)
+    print(f"=> Nạp {len(filtered)}/{len(model_state)} tensor")
+    model.eval().to(device)
+
+    metrics = run_eval(
+        model=model,
+        data_root=args.data_root,
+        test_transform=_build_test_tfms(args.eval_legacy_resize),
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=False,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        device=device,
+        use_amp=False,
+        amp_dtype=torch.float16,
+        use_channels_last=False,
+        q_chunk_size=args.eval_q_chunk_size,
+        use_fp16_sim=(not args.no_fp16_sim),
+        verbose_eval=args.eval_verbose,
+        rerank=args.eval_rerank,
+        rerank_k1=args.eval_rerank_k1,
+        rerank_alpha=args.eval_rerank_alpha,
+        tta_flip=args.eval_tta_flip,
+        split_seed=args.eval_split_seed,
+        gallery_mode=args.eval_gallery,
+    )
+    print_eval_report(metrics, title="Evaluation (eval-only)")
+
+
 def main() -> None:
     args = parse_args()
     # Log to log.txt next to the checkpoint unless --log-path overrides it.
@@ -1797,6 +1895,9 @@ def main() -> None:
         print("=" * 72)
 
     set_seed(args.seed)
+    if args.eval_only:
+        _run_eval_only(args)
+        return
     configure_cuda_for_speed()
 
     if args.grad_accum < 1:
@@ -1875,11 +1976,7 @@ def main() -> None:
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-    test_tfms = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    test_tfms = _build_test_tfms(args.eval_legacy_resize)
 
     pk_k = args.pk_k
     if pk_k < 2:
@@ -2168,6 +2265,7 @@ def main() -> None:
                 rerank_alpha=args.eval_rerank_alpha,
                 tta_flip=args.eval_tta_flip,
                 split_seed=args.eval_split_seed,
+                gallery_mode=args.eval_gallery,
             )
             print_eval_report(metrics, title=f"Evaluation @ Epoch {epoch}")
             if save_best:
@@ -2205,6 +2303,7 @@ def main() -> None:
             rerank_alpha=args.eval_rerank_alpha,
             tta_flip=args.eval_tta_flip,
             split_seed=args.eval_split_seed,
+            gallery_mode=args.eval_gallery,
         )
         print_eval_report(metrics, title="Final Evaluation")
         if save_best:

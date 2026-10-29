@@ -129,6 +129,24 @@ Preprocessing protocol (VRU + VRAI):
 - Both changes shift mAP/Rank-1, so numbers are not directly comparable with runs
   made before this protocol change.
 
+Re-running the old protocol on an existing checkpoint (no retraining):
+
+```bash
+# old protocol (gallery = first frame, test = Resize(256) + CenterCrop(224))
+python train.py --eval-only --checkpoint /content/drive/MyDrive/ReID_Research/results/gasnet_convnext_bcgg.pth \
+  --data-root /content --dataset vru --use-gem \
+  --eval-gallery first --eval-legacy-resize
+
+# new protocol (gallery = random, test = Resize(224))
+python train.py --eval-only --checkpoint /content/drive/MyDrive/ReID_Research/results/gasnet_convnext_bcgg.pth \
+  --data-root /content --dataset vru --use-gem --eval-gallery random
+```
+
+`--eval-only` auto-detects backbone / gate / `num_classes` from the checkpoint, so
+only `--use-gem` has to match training (GeM has no parameters, so it is not in the
+checkpoint). Mix the two flags (`--eval-gallery first` without
+`--eval-legacy-resize`, and vice versa) to see how much each change costs.
+
 ## 7) Important Arguments
 
 - `--run-eval`: enable evaluation.
@@ -147,6 +165,9 @@ Preprocessing protocol (VRU + VRAI):
 - `--no-fp16-sim`: disable bf16/fp16 similarity matmul during evaluation.
 - `--eval-verbose`: print progress while evaluating `Big` split.
 - `--eval-split-seed`: seed for the random gallery pick per identity (default `42`).
+- `--eval-gallery {random,first}`: gallery image per identity — `random` (default) or `first` (legacy first-frame protocol).
+- `--eval-legacy-resize`: legacy eval preprocessing (`Resize(256)` + `CenterCrop(224)`) instead of `Resize(224)`.
+- `--eval-only` + `--checkpoint PATH`: evaluate a saved checkpoint with the current eval flags and exit (no training).
 - `--save-path`: checkpoint path. Its directory also receives `log.txt` by default.
 - `--log-path`: override the log file path (default `<dir of --save-path>/log.txt`).
 - `--save-best` / `--no-save-best`: enable/disable saving `*.best.pth` when eval runs (enabled by default with `--run-eval`).

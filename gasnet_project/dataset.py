@@ -31,18 +31,24 @@ def read_split_file(pic_dir: Path, file_path: Path) -> List[Sample]:
     return samples
 
 
+GALLERY_MODES = ("random", "first")
+
+
 def build_query_gallery(
     samples: List[Sample],
     seed: int | None = 42,
+    gallery_mode: str = "random",
 ) -> Tuple[List[Sample], List[Sample]]:
-    """Split into query/gallery with one *random* gallery image per identity.
+    """Split into query/gallery with exactly one gallery image per identity.
 
-    Previously the gallery image was always the lowest ``image_id`` of each
-    identity (the first frame), which biases the protocol. Now the gallery is
-    drawn uniformly at random per identity; the remaining images become
-    queries. ``seed`` keeps the split reproducible across runs (set it to
-    ``None`` for a fresh split every call).
+    ``gallery_mode="random"`` (default) draws the gallery image uniformly at
+    random per identity; ``"first"`` reproduces the legacy protocol where the
+    gallery image is always the lowest ``image_id`` (first frame) of each
+    identity. ``seed`` keeps the random split reproducible across runs (set it
+    to ``None`` for a fresh split every call).
     """
+    if gallery_mode not in GALLERY_MODES:
+        raise ValueError(f"Unknown gallery_mode {gallery_mode!r} (expected one of {GALLERY_MODES})")
     rng = random.Random(seed) if seed is not None else random
 
     by_vehicle: Dict[int, List[Sample]] = {}
@@ -54,6 +60,11 @@ def build_query_gallery(
 
     for _, group in by_vehicle.items():
         group = list(group)
+        if gallery_mode == "first":
+            group.sort(key=lambda x: x.image_id)
+            gallery.append(group[0])
+            query.extend(group[1:])
+            continue
         gallery_pos = rng.randrange(len(group))
         gallery.append(group[gallery_pos])
         query.extend(group[:gallery_pos])
